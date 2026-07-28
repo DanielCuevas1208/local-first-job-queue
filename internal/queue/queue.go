@@ -19,6 +19,7 @@ type EnqueueOption func(*enqueueConfig)
 type enqueueConfig struct {
 	idempotencyKey string
 	maxAttempts    int
+	runAt          *time.Time
 }
 
 // WithIdempotencyKey makes Enqueue return the existing job when a job with the
@@ -34,6 +35,32 @@ func WithIdempotencyKey(key string) EnqueueOption {
 func WithMaxAttempts(n int) EnqueueOption {
 	return func(c *enqueueConfig) {
 		c.maxAttempts = n
+	}
+}
+
+// WithRunAt delays leasing of the job until the supplied time. A zero value is
+// treated as no delay. Use WithRunAfter for a relative delay from now.
+func WithRunAt(t time.Time) EnqueueOption {
+	return func(c *enqueueConfig) {
+		if t.IsZero() {
+			c.runAt = nil
+			return
+		}
+		v := t.UTC()
+		c.runAt = &v
+	}
+}
+
+// WithRunAfter delays leasing of the job by d relative to the enqueue moment.
+// A non-positive duration means the job is ready immediately.
+func WithRunAfter(d time.Duration) EnqueueOption {
+	return func(c *enqueueConfig) {
+		if d <= 0 {
+			c.runAt = nil
+			return
+		}
+		v := time.Now().UTC().Add(d)
+		c.runAt = &v
 	}
 }
 
@@ -73,6 +100,9 @@ func (q *Queue) Enqueue(kind, payload string, opts ...EnqueueOption) (*Job, erro
 		key := cfg.idempotencyKey
 		job.IdempotencyKey = &key
 	}
+	if cfg.runAt != nil {
+		job.RunAt = cfg.runAt
+	}
 
 	inserted, err := q.store.InsertJob(job)
 	if err != nil {
@@ -90,19 +120,34 @@ func (q *Queue) Enqueue(kind, payload string, opts ...EnqueueOption) (*Job, erro
 		return existing, nil
 	}
 
+	if err := q.appendEnqueueEvents(job, now); err != nil {
+		return nil, err
+	}
+
+	return &job, nil
+}
+
+// appendEnqueueEvents logs the creation event for a freshly stored job. When
+// the job carries a RunAt timestamp, a scheduled event is logged in place of
+// the plain enqueued event so the timeline shows the delay.
+func (q *Queue) appendEnqueueEvents(job Job, now time.Time) error {
 	ev := Event{
 		JobID:     job.ID,
 		EventType: EventEnqueued,
 		Timestamp: now,
 	}
-	meta, _ := json.Marshal(map[string]string{"kind": kind})
+	meta, _ := json.Marshal(map[string]string{"kind": job.Kind})
 	m := string(meta)
 	ev.Metadata = &m
-	if err := q.store.AppendEvent(ev); err != nil {
-		return nil, fmt.Errorf("log event: %w", err)
+	if job.RunAt != nil {
+		ev.EventType = EventScheduled
+		m = job.RunAt.UTC().Format(time.RFC3339)
+		ev.Metadata = &m
 	}
-
-	return &job, nil
+	if err := q.store.AppendEvent(ev); err != nil {
+		return fmt.Errorf("log event: %w", err)
+	}
+	return nil
 }
 
 func (q *Queue) Lease(ctx context.Context, kind string, leaseDuration time.Duration) (*Job, error) {

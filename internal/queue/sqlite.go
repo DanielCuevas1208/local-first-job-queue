@@ -37,7 +37,8 @@ func migrate(db *sql.DB) error {
 			idempotency_key TEXT UNIQUE,
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
-			leased_until TEXT
+			leased_until TEXT,
+			run_at TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +50,7 @@ func migrate(db *sql.DB) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state)`,
 		`CREATE INDEX IF NOT EXISTS idx_jobs_kind_state ON jobs(kind, state)`,
+		`CREATE INDEX IF NOT EXISTS idx_jobs_kind_ready ON jobs(kind, state, run_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)`,
 		`PRAGMA journal_mode=WAL`,
@@ -58,6 +60,35 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(q); err != nil {
 			return fmt.Errorf("exec %q: %w", trunc(q, 60), err)
 		}
+	}
+	return ensureColumn(db, "jobs", "run_at", "TEXT")
+}
+
+// ensureColumn adds a missing column to an existing table. Databases created
+// before a schema change still gain the column on the next open. The caller is
+// responsible for the column type and nullability; the new column allows NULL.
+func ensureColumn(db *sql.DB, table, column, colType string) error {
+	rows, err := db.Query(`PRAGMA table_info("` + table + `")`)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return fmt.Errorf("scan %s info: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, colType)
+	if _, err := db.Exec(stmt); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
 	}
 	return nil
 }
@@ -88,12 +119,17 @@ func (s *SQLiteStore) InsertJob(j Job) (inserted bool, err error) {
 		lu.String = j.LeasedUntil.UTC().Format(time.RFC3339)
 		lu.Valid = true
 	}
+	ra := sql.NullString{}
+	if j.RunAt != nil {
+		ra.String = j.RunAt.UTC().Format(time.RFC3339)
+		ra.Valid = true
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO jobs (id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO jobs (id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until, run_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(idempotency_key) DO NOTHING`,
 		j.ID, j.Kind, j.Payload, string(j.State), j.RetryCount, j.MaxAttempts,
-		ik, j.CreatedAt.UTC().Format(time.RFC3339), j.UpdatedAt.UTC().Format(time.RFC3339), lu,
+		ik, j.CreatedAt.UTC().Format(time.RFC3339), j.UpdatedAt.UTC().Format(time.RFC3339), lu, ra,
 	)
 	if err != nil {
 		return false, fmt.Errorf("insert job: %w", err)
@@ -107,7 +143,7 @@ func (s *SQLiteStore) InsertJob(j Job) (inserted bool, err error) {
 
 func (s *SQLiteStore) FindJobByIdempotencyKey(key string) (*Job, error) {
 	row := s.db.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until
+		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until, run_at
 		 FROM jobs WHERE idempotency_key = ?`, key)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
@@ -121,7 +157,7 @@ func (s *SQLiteStore) FindJobByIdempotencyKey(key string) (*Job, error) {
 
 func (s *SQLiteStore) GetJob(id string) (Job, error) {
 	row := s.db.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until
+		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until, run_at
 		 FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -136,9 +172,10 @@ func (s *SQLiteStore) LeaseJob(kind string, leaseDuration time.Duration) (*Job, 
 	defer tx.Rollback()
 
 	row := tx.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until
+		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until, run_at
 		 FROM jobs WHERE kind = ? AND state = 'pending'
-		 ORDER BY created_at ASC LIMIT 1`, kind)
+		   AND (run_at IS NULL OR run_at <= ?)
+		 ORDER BY COALESCE(run_at, created_at) ASC LIMIT 1`, kind, now.Format(time.RFC3339))
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -177,7 +214,7 @@ func (s *SQLiteStore) LeaseJobByID(id string, leaseDuration time.Duration) (*Job
 	defer tx.Rollback()
 
 	row := tx.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until
+		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until, run_at
 		 FROM jobs WHERE id = ?`, id)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
@@ -252,7 +289,7 @@ func (s *SQLiteStore) FailJob(id string, retry bool) error {
 func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 	now := time.Now().UTC()
 	rows, err := s.db.Query(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until
+		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until, run_at
 		 FROM jobs WHERE state = 'leased' AND leased_until < ?`,
 		now.Format(time.RFC3339))
 	if err != nil {
@@ -313,7 +350,7 @@ func (s *SQLiteStore) GetAllJobs() ([]Job, error) {
 
 func (s *SQLiteStore) queryJobs(where string) ([]Job, error) {
 	rows, err := s.db.Query(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until
+		`SELECT id, kind, payload, state, retry_count, max_attempts, idempotency_key, created_at, updated_at, leased_until, run_at
 		 FROM jobs ` + where)
 	if err != nil {
 		return nil, fmt.Errorf("query jobs: %w", err)
@@ -395,9 +432,9 @@ type scannable interface {
 func scanJob(row scannable) (Job, error) {
 	var j Job
 	var stateStr, createdAt, updatedAt string
-	var ik, lu sql.NullString
+	var ik, lu, ra sql.NullString
 	err := row.Scan(&j.ID, &j.Kind, &j.Payload, &stateStr, &j.RetryCount, &j.MaxAttempts,
-		&ik, &createdAt, &updatedAt, &lu)
+		&ik, &createdAt, &updatedAt, &lu, &ra)
 	if err != nil {
 		return Job{}, err
 	}
@@ -417,6 +454,13 @@ func scanJob(row scannable) (Job, error) {
 			return Job{}, fmt.Errorf("parse leased_until: %w", err)
 		}
 		j.LeasedUntil = &t
+	}
+	if ra.Valid {
+		t, err := time.Parse(time.RFC3339, ra.String)
+		if err != nil {
+			return Job{}, fmt.Errorf("parse run_at: %w", err)
+		}
+		j.RunAt = &t
 	}
 	return j, nil
 }

@@ -140,6 +140,128 @@ func TestIdempotencyKey(t *testing.T) {
 	}
 }
 
+// TestEnqueueScheduledFutureNotLeased confirms that a job with a run_at time
+// in the future stays pending and is not leased. The job becomes leasable
+// only after its run_at deadline has passed.
+func TestEnqueueScheduledFutureNotLeased(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	future := time.Now().Add(time.Hour).UTC()
+	job, err := q.Enqueue("test", `{}`, WithRunAt(future))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if job.RunAt == nil || !job.RunAt.Equal(future) {
+		t.Fatalf("expected run_at %s, got %v", future, job.RunAt)
+	}
+
+	ctx := context.Background()
+	got, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected no lease before run_at, got %s", got.ID)
+	}
+
+	// Move run_at into the past and confirm the job becomes leasable.
+	past := time.Now().Add(-time.Minute).UTC()
+	if _, err := s.db.Exec(
+		`UPDATE jobs SET run_at = ? WHERE id = ?`,
+		past.Format(time.RFC3339), job.ID); err != nil {
+		t.Fatalf("update run_at: %v", err)
+	}
+
+	got, err = q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease after: %v", err)
+	}
+	if got == nil || got.ID != job.ID {
+		t.Fatalf("expected lease of %s, got %v", job.ID, got)
+	}
+}
+
+// TestScheduledEventLogged verifies that an enqueued scheduled job records a
+// scheduled event whose metadata is the run_at timestamp.
+func TestScheduledEventLogged(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	at := time.Now().Add(time.Hour).UTC()
+	job, err := q.Enqueue("test", `{}`, WithRunAt(at))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	events, err := s.GetJobEvents(job.ID)
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != EventScheduled {
+		t.Fatalf("expected one scheduled event, got %+v", events)
+	}
+	if events[0].Metadata == nil {
+		t.Fatal("expected non-nil metadata")
+	}
+	if _, err := time.Parse(time.RFC3339, *events[0].Metadata); err != nil {
+		t.Fatalf("metadata is not RFC3339: %v", err)
+	}
+}
+
+// TestRunAfterZeroIsReady confirms that a zero or negative delay yields a job
+// with no run_at that leases immediately.
+func TestRunAfterZeroIsReady(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	job, err := q.Enqueue("test", `{}`, WithRunAfter(0))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if job.RunAt != nil {
+		t.Fatalf("expected nil run_at, got %v", job.RunAt)
+	}
+	ctx := context.Background()
+	leased, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil || leased == nil || leased.ID != job.ID {
+		t.Fatalf("expected immediate lease, got %v %v", leased, err)
+	}
+}
+
+// TestLeaseOrderRespectsRunAt confirms that the lease picks the earliest ready
+// job, not the earliest created job. A scheduled job with an earlier effective
+// time must be leased before a plain pending job created later.
+func TestLeaseOrderRespectsRunAt(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	earlier, err := q.Enqueue("test", `{"n":1}`, WithRunAfter(10*time.Millisecond))
+	if err != nil {
+		t.Fatalf("enqueue 1: %v", err)
+	}
+
+	// Give the first job a run_at in the future, then enqueue a ready job. The
+	// ready job should lease first because it is the only ready one.
+	time.Sleep(5 * time.Millisecond)
+	later, err := q.Enqueue("test", `{"n":2}`)
+	if err != nil {
+		t.Fatalf("enqueue 2: %v", err)
+	}
+
+	ctx := context.Background()
+	leased, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil || leased == nil || leased.ID != later.ID {
+		t.Fatalf("expected ready job %s, got %v %v", later.ID, leased, err)
+	}
+
+	// Wait for the scheduled job to become ready and lease it next.
+	time.Sleep(10 * time.Millisecond)
+	leased, err = q.Lease(ctx, "test", time.Minute)
+	if err != nil || leased == nil || leased.ID != earlier.ID {
+		t.Fatalf("expected scheduled job %s, got %v %v", earlier.ID, leased, err)
+	}
+}
+
 func TestRecoverOrphanedLeases(t *testing.T) {
 	s := newTestStore(t)
 	q := NewQueue(s)

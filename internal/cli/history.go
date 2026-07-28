@@ -57,6 +57,9 @@ func History(args []string) error {
 	if job.IdempotencyKey != nil {
 		fmt.Printf("  idem key : %s\n", *job.IdempotencyKey)
 	}
+	if job.RunAt != nil {
+		fmt.Printf("  run at   : %s\n", job.RunAt.Format("2006-01-02 15:04:05"))
+	}
 
 	fmt.Printf("\nEvents (%d)\n", len(events))
 	for _, e := range events {
