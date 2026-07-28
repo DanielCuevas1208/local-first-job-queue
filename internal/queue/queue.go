@@ -1,0 +1,222 @@
+package queue
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// DefaultMaxAttempts is the maximum number of attempts allowed for a job,
+// including the first attempt. A job with this value runs once and may retry
+// twice more before it enters the failed state.
+const DefaultMaxAttempts = 3
+
+type EnqueueOption func(*enqueueConfig)
+
+type enqueueConfig struct {
+	idempotencyKey string
+	maxAttempts    int
+}
+
+// WithIdempotencyKey makes Enqueue return the existing job when a job with the
+// same key already exists. Duplicate enqueues with the same key are no-ops.
+func WithIdempotencyKey(key string) EnqueueOption {
+	return func(c *enqueueConfig) {
+		c.idempotencyKey = key
+	}
+}
+
+// WithMaxAttempts sets the maximum number of attempts allowed for the job,
+// including the first attempt. Values below one are clamped to one.
+func WithMaxAttempts(n int) EnqueueOption {
+	return func(c *enqueueConfig) {
+		c.maxAttempts = n
+	}
+}
+
+type Queue struct {
+	store *SQLiteStore
+}
+
+func NewQueue(store *SQLiteStore) *Queue {
+	return &Queue{store: store}
+}
+
+func (q *Queue) Enqueue(kind, payload string, opts ...EnqueueOption) (*Job, error) {
+	cfg := enqueueConfig{maxAttempts: DefaultMaxAttempts}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	if cfg.maxAttempts < 1 {
+		cfg.maxAttempts = 1
+	}
+
+	id, err := newID()
+	if err != nil {
+		return nil, fmt.Errorf("new id: %w", err)
+	}
+
+	now := time.Now().UTC()
+	job := Job{
+		ID:          id,
+		Kind:        kind,
+		Payload:     payload,
+		State:       StatePending,
+		MaxAttempts: cfg.maxAttempts,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	if cfg.idempotencyKey != "" {
+		key := cfg.idempotencyKey
+		job.IdempotencyKey = &key
+	}
+
+	inserted, err := q.store.InsertJob(job)
+	if err != nil {
+		return nil, fmt.Errorf("create job: %w", err)
+	}
+	if !inserted {
+		// A job with the same idempotency key already exists. Return it.
+		existing, err := q.store.FindJobByIdempotencyKey(cfg.idempotencyKey)
+		if err != nil {
+			return nil, fmt.Errorf("lookup idempotent job: %w", err)
+		}
+		if existing == nil {
+			return nil, errors.New("idempotent insert reported a conflict but no job was found")
+		}
+		return existing, nil
+	}
+
+	ev := Event{
+		JobID:     job.ID,
+		EventType: EventEnqueued,
+		Timestamp: now,
+	}
+	meta, _ := json.Marshal(map[string]string{"kind": kind})
+	m := string(meta)
+	ev.Metadata = &m
+	if err := q.store.AppendEvent(ev); err != nil {
+		return nil, fmt.Errorf("log event: %w", err)
+	}
+
+	return &job, nil
+}
+
+func (q *Queue) Lease(ctx context.Context, kind string, leaseDuration time.Duration) (*Job, error) {
+	job, err := q.store.LeaseJob(kind, leaseDuration)
+	if err != nil {
+		return nil, fmt.Errorf("lease job: %w", err)
+	}
+	if job == nil {
+		return nil, nil
+	}
+
+	ev := Event{
+		JobID:     job.ID,
+		EventType: EventLeased,
+		Timestamp: time.Now().UTC(),
+	}
+	if err := q.store.AppendEvent(ev); err != nil {
+		return nil, fmt.Errorf("log event: %w", err)
+	}
+
+	return job, nil
+}
+
+func (q *Queue) Acknowledge(jobID string) error {
+	if err := q.store.CompleteJob(jobID); err != nil {
+		return fmt.Errorf("complete job: %w", err)
+	}
+	ev := Event{
+		JobID:     jobID,
+		EventType: EventAcknowledged,
+		Timestamp: time.Now().UTC(),
+	}
+	if err := q.store.AppendEvent(ev); err != nil {
+		return fmt.Errorf("log event: %w", err)
+	}
+	return nil
+}
+
+func (q *Queue) Fail(jobID string, errMsg string) error {
+	job, err := q.store.GetJob(jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+
+	// MaxAttempts stores the maximum number of attempts, including the first.
+	// The current attempt is RetryCount plus one. Retry only when an additional
+	// attempt still fits inside the limit.
+	shouldRetry := job.RetryCount+1 < job.MaxAttempts
+	if err := q.store.FailJob(jobID, shouldRetry); err != nil {
+		return fmt.Errorf("fail job: %w", err)
+	}
+
+	evType := EventFailed
+	meta := errMsg
+	if shouldRetry {
+		evType = EventRetried
+		meta = fmt.Sprintf("attempt %d/%d: %s", job.RetryCount+1, job.MaxAttempts, errMsg)
+	}
+	ev := Event{
+		JobID:     jobID,
+		EventType: evType,
+		Timestamp: time.Now().UTC(),
+		Metadata:  &meta,
+	}
+	if err := q.store.AppendEvent(ev); err != nil {
+		return fmt.Errorf("log event: %w", err)
+	}
+	return nil
+}
+
+// Recover returns orphaned leases to the pending state. A lease is orphaned
+// when its deadline passed and no worker acknowledged it. Recovered jobs get
+// one extra attempt. When no attempt remains, the job enters the failed state.
+func (q *Queue) Recover() (int, error) {
+	recovered, err := q.store.RecoverOrphanedLeases()
+	if err != nil {
+		return 0, fmt.Errorf("recover: %w", err)
+	}
+	now := time.Now().UTC()
+	for _, r := range recovered {
+		ev := Event{
+			JobID:     r.ID,
+			EventType: EventRecovered,
+			Timestamp: now,
+		}
+		meta := fmt.Sprintf("attempt %d/%d", r.RetryCount, r.MaxAttempts)
+		ev.Metadata = &meta
+		if err := q.store.AppendEvent(ev); err != nil {
+			return len(recovered), fmt.Errorf("log recovery event: %w", err)
+		}
+	}
+	return len(recovered), nil
+}
+
+func (q *Queue) Inspect() (*QueueSnapshot, error) {
+	jobs, err := q.store.GetAllJobs()
+	if err != nil {
+		return nil, fmt.Errorf("get jobs: %w", err)
+	}
+	events, err := q.store.GetAllEvents()
+	if err != nil {
+		return nil, fmt.Errorf("get events: %w", err)
+	}
+	stats, err := q.store.GetQueueStats()
+	if err != nil {
+		return nil, fmt.Errorf("get stats: %w", err)
+	}
+	return &QueueSnapshot{Jobs: jobs, Events: events, Stats: stats}, nil
+}
+
+func newID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
+}
