@@ -79,12 +79,16 @@ func RenderSnapshot(snap *queue.QueueSnapshot, w io.Writer) {
 			if j.IdempotencyKey != nil {
 				ik = fmt.Sprintf(" ik=%s", *j.IdempotencyKey)
 			}
+			sched := ""
+			if j.RunAt != nil {
+				sched = fmt.Sprintf(" run_at=%s", j.RunAt.Format("2006-01-02 15:04:05"))
+			}
 			shortID := j.ID
 			if len(shortID) > 8 {
 				shortID = shortID[:8]
 			}
-			fmt.Fprintf(w, "  %s kind=%s state=%s attempts=%d/%d%s\n",
-				shortID, j.Kind, j.State, j.RetryCount, j.MaxAttempts, ik)
+			fmt.Fprintf(w, "  %s kind=%s state=%s attempts=%d/%d%s%s\n",
+				shortID, j.Kind, j.State, j.RetryCount, j.MaxAttempts, ik, sched)
 		}
 	}
 }

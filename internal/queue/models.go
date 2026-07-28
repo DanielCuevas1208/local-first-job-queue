@@ -22,12 +22,16 @@ type Job struct {
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
 	LeasedUntil    *time.Time `json:"leased_until,omitempty"`
+	// RunAt is the earliest time the job may be leased. When nil, the job is
+	// ready as soon as it is pending. The field is stored as RFC3339 UTC.
+	RunAt *time.Time `json:"run_at,omitempty"`
 }
 
 type EventType string
 
 const (
 	EventEnqueued     EventType = "enqueued"
+	EventScheduled    EventType = "scheduled"
 	EventLeased       EventType = "leased"
 	EventAcknowledged EventType = "acknowledged"
 	EventFailed       EventType = "failed"
