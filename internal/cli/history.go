@@ -53,6 +53,7 @@ func History(args []string) error {
 	fmt.Printf("  kind     : %s\n", job.Kind)
 	fmt.Printf("  payload  : %s\n", job.Payload)
 	fmt.Printf("  state    : %s\n", job.State)
+	fmt.Printf("  priority : %d\n", job.Priority)
 	fmt.Printf("  attempts : %d / %d\n", job.RetryCount, job.MaxAttempts)
 	if job.IdempotencyKey != nil {
 		fmt.Printf("  idem key : %s\n", *job.IdempotencyKey)

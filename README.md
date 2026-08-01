@@ -1,153 +1,254 @@
 # Local-first Durable Job Queue
 
-A durable background job queue with SQLite storage. It supports leases, retries,
-idempotency keys, crash recovery, and an append-only event log.
+A small durable background queue built with Go and SQLite.
+
+The project shows leases, retries, idempotency, crash recovery, priority dispatch, and an append-only event log.
+
+## Value
+
+Use this project to study queue behavior without an external service.
+
+Every lease, retry, recovery, and acknowledgement remains visible in SQLite.
+
+The demo injects repeatable faults, so failure paths are easy to inspect.
 
 ## Architecture
 
-The queue stores jobs in SQLite. A worker leases each job for exclusive
-processing. If the worker crashes, the next worker recovers expired leases.
-Each state change is recorded in the event log.
+The queue separates durable state from worker execution.
 
-Components:
+- `internal/queue` owns the public queue API and SQLite store.
+- `internal/worker` leases jobs and runs handlers.
+- `internal/fault` injects deterministic errors, panics, delays, and stalls.
+- `internal/cli` renders commands, snapshots, history, and the demo.
+- `internal/fixture` provides repeatable sample workloads.
 
-- `internal/queue` — Core queue API and SQLite storage.
-- `internal/worker` — Worker that leases and executes jobs.
-- `internal/fixture` — Sample data generator.
-- `cmd/enqueue` — CLI to add jobs.
-- `cmd/inspect` — CLI to view queue state and events.
-- `cmd/work` — CLI to start a worker.
+A job starts as `pending`.
 
-## Quick start
+A worker claims it with a time-limited lease.
+
+The worker acknowledges success or records failure.
+
+An expired lease returns to the queue during recovery.
+
+Each transition appends an event with a timestamp and optional metadata.
+
+## Setup
 
 Requires Go 1.25.
 
-```
+Run these commands from the repository root.
+
+```text
 go build -o jobqueue .
-./jobqueue enqueue -kind email -payload '{"to":"user@example.com"}'
+./jobqueue enqueue -kind email -payload '{"to":"user@example.com"}' -priority 20
 ./jobqueue work -kind email
 ./jobqueue inspect
 ```
 
-The `inspect` command shows queue state, job list, and recent events.
+Use `-priority` to place urgent work ahead of normal work.
 
-### Sample data
+Higher values run first.
 
+The default priority is zero.
+
+Use `-run-at` or `-run-after` to delay leasing.
+
+Run the deterministic showcase with this command.
+
+```text
+go run . demo
 ```
-go run ./internal/fixture/ -db queue.db
+
+Load sample jobs with this command.
+
+```text
+go run . seed -db queue.db
+go run . inspect -db queue.db
 ```
 
 ## Commands
 
-### enqueue
+### `enqueue`
 
-Add a job to the queue.
-
-```
-jobqueue enqueue -kind <type> -payload <json> [-idempotency-key <key>] [-max-attempts <n>] [-run-at <RFC3339> | -run-after <duration>] [-db <path>]
+```text
+jobqueue enqueue -kind <type> -payload <json> [-priority <n>] [-idempotency-key <key>] [-max-attempts <n>] [-run-at <RFC3339> | -run-after <duration>] [-db <path>]
 ```
 
-Use `-run-at` to delay leasing until an absolute time. Use `-run-after` to delay leasing by a duration from enqueue. The two flags are mutually exclusive. A delayed job stays in the pending state until its run_at time passes.
+`-priority` uses zero by default.
 
-### work
+`-run-at` and `-run-after` cannot appear together.
 
-Start a worker that processes jobs of a given kind.
+### `work`
 
+```text
+jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-db <path>]
 ```
-jobqueue work -kind <type> [-concurrency <n>] [-db <path>]
-```
 
-The worker recovers orphaned leases on startup.
+The worker recovers expired leases when it starts.
 
-### inspect
+### `inspect`
 
-View queue state, jobs, and event log.
-
-```
+```text
 jobqueue inspect [-json] [-db <path>]
 ```
+
+The command prints state counts, recent events, and job details.
+
+The JSON form supports scripts and other inspection tools.
+
+### `history`
+
+```text
+jobqueue history <job-id> [-json] [-db <path>]
+```
+
+The command prints one job and its event timeline.
+
+### `seed`
+
+```text
+jobqueue seed [-db <path>]
+```
+
+The command loads three idempotent jobs for each bundled workload.
+
+### `demo`
+
+```text
+jobqueue demo [-db <path>] [-keep] [-run <duration>] [-kind <type>]
+```
+
+The demo combines priority, retries, panic recovery, crash recovery, and scheduling.
 
 ## Features
 
 ### Leases
 
-Leases prevent duplicate processing. A worker leases a job for a fixed duration. Only one worker can lease a given job at a time.
+A lease gives one worker temporary ownership of a job.
+
+An expired lease becomes recoverable.
+
+### Priority dispatch
+
+Ready jobs with higher priority values lease first.
+
+A future job cannot bypass its `run_at` time, even when its priority is higher.
+
+Equal priorities use readiness time, creation time, and job ID as deterministic tie breakers.
 
 ### Retries
 
-When a job handler fails, the job is returned to the pending state with an incremented retry count. After exceeding MaxRetries, the job moves to failed.
+A failed handler returns the job to `pending` while attempts remain.
 
-### Idempotency keys
+The job enters `failed` after the attempt budget is exhausted.
 
-An idempotency key ensures that enqueuing the same logical job multiple times produces the same job ID.
+### Idempotency
+
+An idempotency key makes repeated enqueue calls return one durable job.
+
+The database enforces the uniqueness rule.
 
 ### Crash recovery
 
-On startup, the worker detects leases that have expired. Those jobs are returned to the pending state and retried.
+Startup recovery finds leases past their deadlines.
+
+Recovery consumes an attempt and records a `recovered` event.
 
 ### Event log
 
-Every state change is appended to the events table. The log is readable with the inspect command.
+Every state change appends one event row.
 
-### Scheduled jobs
+The `history` command shows one job's complete timeline.
 
-A job can wait until a chosen time before a worker leases it. Set `WithRunAt` or `WithRunAfter` on enqueue. The lease query skips pending jobs whose run_at time is in the future. Once that time passes, the job becomes ready and leases in run_at order. The append-only log records a `scheduled` event for delayed jobs.
+### Scheduling
 
-## Tests
+A scheduled job stores its earliest lease time in `run_at`.
 
-```
-go test -v -count=1 -race ./...
-```
+SQLite stores queue timestamps with nanosecond precision.
 
-The test status on the main branch is set by CI. The workflow runs `go vet`, `go build`, `go test -race`, and the queue benchmarks on each push and pull request.
-
-## Benchmarks
-
-```
-go test -bench=. -benchmem ./internal/queue/
-```
+Existing databases gain new columns through idempotent migrations.
 
 ## Sample output
 
-```
-$ go build -o jobqueue .
-$ ./jobqueue enqueue -kind email -payload '{"to":"user@example.com"}' -run-after 2s
-enqueued job 7bfb363d-... (email)
-scheduled for 2026-07-28T19:01:03Z
+Run `jobqueue demo` to see a complete local scenario.
 
-$ ./jobqueue work -kind email
-worker started kind="email" concurrency=1 lease=30s poll=1s
-recovered 0 orphaned jobs
-processed kind=email id=7bfb363d-... payload={"to":"user@example.com"}
+```text
+== Local-first Durable Job Queue: demo ==
+enqueuing scenario jobs:
+  first-try success      alpha                  priority= 0 <id>
+  priority retry         beta                  priority=10 <id>
+  orphaned by a crash    delta                 priority= 0 <id>
 
-$ ./jobqueue inspect
+orphaned job delta was leased and then abandoned.
+starting worker; it will recover orphans and process jobs.
+
+queue drained before the run deadline.
+
 Queue state
 -----------
-  completed: 1
+  completed: 5
+  failed: 1
 
-Recent events (3)
---------------
-  [19:01:03] 7bfb363d scheduled 2026-07-28T19:01:03Z
-  [19:01:05] 7bfb363d leased
-  [19:01:05] 7bfb363d acknowledged
+Recent events (29)
+------------------
+  [12:00:00] <id> acknowledged
+  [12:00:00] <id> recovered attempt 1/3
 
-Jobs (1)
+Jobs (6)
 --------
-  7bfb363d kind=email state=completed attempts=0/3
+  <id> kind=demo priority=10 state=completed attempts=2/3
 ```
+
+The demo uses generated job IDs and current timestamps.
+
+The final counts depend on the scenario and run deadline.
+
+## Verification
+
+Run the full test suite with this command.
+
+```text
+go test -v -count=1 -race ./...
+```
+
+Run static checks with these commands.
+
+```text
+go vet ./...
+go build ./...
+```
+
+Run queue benchmarks with this command.
+
+```text
+go test ./internal/queue -run '^$' -bench Benchmark -benchmem -count=1
+```
+
+Verification status: tests, vet, build, and benchmarks pass locally on Go 1.25.
+
+Race tests run in CI on Ubuntu, where the required C compiler is available.
 
 ## Limitations
 
-The queue uses one writer connection because SQLite serializes writes. A backlog
-can grow when the writer cannot keep up. The store keeps all jobs and events
-until an operator removes them. There is no priority field. Ready jobs of one
-kind share one FIFO lane. The worker is one process and does not coordinate
-across hosts.
+SQLite serializes writes through one store connection.
+
+A sustained backlog can exceed the writer's capacity.
+
+Jobs and events remain until an operator removes them.
+
+A high-priority stream can delay lower-priority jobs.
+
+The queue has no dead-letter workflow or priority aging.
+
+The worker is one process and does not coordinate across hosts.
+
+The project does not provide Prometheus metrics or a web interface.
 
 ## Roadmap
 
-- [x] Job scheduling (delay execution until a specified time).
-- [ ] Priority queues.
+- [x] Durable leases, retries, idempotency, crash recovery, and event history.
+- [x] Scheduled jobs with nanosecond-safe release times.
+- [x] Priority-aware dispatch with deterministic ordering.
 - [ ] Dead-letter queue for permanently failed jobs.
 - [ ] Prometheus metrics.
 - [ ] Web UI for queue inspection.
@@ -155,4 +256,12 @@ across hosts.
 
 ### Release notes
 
-This release adds scheduled jobs. A new `run_at` column on the jobs table stores the earliest lease time. Existing databases gain the column on the next open through an idempotent migration. The lease query and sort use the column, so delayed jobs wait and then run in time order. The event log records a `scheduled` event for each delayed enqueue.
+This release adds durable priority dispatch.
+
+Jobs store an integer priority with a default of zero.
+
+The lease query selects ready jobs by descending priority.
+
+The migration adds `priority` to existing databases before creating its indexes.
+
+The release also preserves sub-second schedule deadlines during SQLite writes.

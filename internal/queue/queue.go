@@ -14,11 +14,15 @@ import (
 // twice more before it enters the failed state.
 const DefaultMaxAttempts = 3
 
+// DefaultPriority is used when an enqueue call does not set a priority.
+const DefaultPriority = 0
+
 type EnqueueOption func(*enqueueConfig)
 
 type enqueueConfig struct {
 	idempotencyKey string
 	maxAttempts    int
+	priority       int
 	runAt          *time.Time
 }
 
@@ -35,6 +39,13 @@ func WithIdempotencyKey(key string) EnqueueOption {
 func WithMaxAttempts(n int) EnqueueOption {
 	return func(c *enqueueConfig) {
 		c.maxAttempts = n
+	}
+}
+
+// WithPriority sets the job priority. Higher values are leased before lower values.
+func WithPriority(priority int) EnqueueOption {
+	return func(c *enqueueConfig) {
+		c.priority = priority
 	}
 }
 
@@ -73,7 +84,7 @@ func NewQueue(store *SQLiteStore) *Queue {
 }
 
 func (q *Queue) Enqueue(kind, payload string, opts ...EnqueueOption) (*Job, error) {
-	cfg := enqueueConfig{maxAttempts: DefaultMaxAttempts}
+	cfg := enqueueConfig{maxAttempts: DefaultMaxAttempts, priority: DefaultPriority}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -93,6 +104,7 @@ func (q *Queue) Enqueue(kind, payload string, opts ...EnqueueOption) (*Job, erro
 		Payload:     payload,
 		State:       StatePending,
 		MaxAttempts: cfg.maxAttempts,
+		Priority:    cfg.priority,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -141,7 +153,7 @@ func (q *Queue) appendEnqueueEvents(job Job, now time.Time) error {
 	ev.Metadata = &m
 	if job.RunAt != nil {
 		ev.EventType = EventScheduled
-		m = job.RunAt.UTC().Format(time.RFC3339)
+		m = job.RunAt.UTC().Format(time.RFC3339Nano)
 		ev.Metadata = &m
 	}
 	if err := q.store.AppendEvent(ev); err != nil {

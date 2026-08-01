@@ -6,21 +6,35 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-and-test:
+  verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: "1.25"
-      - name: Tidy
-        run: go mod tidy
-      - name: Build
-        run: go build ./...
+          cache: true
+      - name: Download modules
+        run: go mod download
+      - name: Verify modules
+        run: go mod verify
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
       - name: Vet
         run: go vet ./...
-      - name: Test
-        run: go test -v -count=1 -race ./...
-      - name: Benchmark
-        run: go test -bench=. -benchmem -count=1 ./internal/queue/
+      - name: Test with race detector
+        run: go test -v -count=1 -race -coverprofile=coverage.out ./...
+      - name: Build
+        run: go build ./...
+      - name: Benchmark queue paths
+        run: go test ./internal/queue -run '^$' -bench Benchmark -benchmem -count=1

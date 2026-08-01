@@ -2,7 +2,9 @@ package queue
 
 import (
 	"context"
+	"database/sql"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"testing"
@@ -17,6 +19,56 @@ func newTestStore(t *testing.T) *SQLiteStore {
 	}
 	t.Cleanup(func() { s.Close() })
 	return s
+}
+
+func TestMigrationAddsPriorityToLegacyDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	_, err = raw.Exec(`CREATE TABLE jobs (
+		id TEXT PRIMARY KEY,
+		kind TEXT NOT NULL,
+		payload TEXT NOT NULL,
+		state TEXT NOT NULL DEFAULT 'pending',
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		max_attempts INTEGER NOT NULL DEFAULT 3,
+		idempotency_key TEXT UNIQUE,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL,
+		leased_until TEXT
+	)`)
+	if err != nil {
+		raw.Close()
+		t.Fatalf("create legacy jobs: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE events (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		job_id TEXT NOT NULL,
+		event_type TEXT NOT NULL,
+		metadata TEXT,
+		timestamp TEXT NOT NULL
+	)`); err != nil {
+		raw.Close()
+		t.Fatalf("create legacy events: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("migrate legacy database: %v", err)
+	}
+	defer store.Close()
+	job, err := NewQueue(store).Enqueue("test", `{}`, WithPriority(7))
+	if err != nil {
+		t.Fatalf("enqueue after migration: %v", err)
+	}
+	if job.Priority != 7 {
+		t.Fatalf("expected priority 7, got %d", job.Priority)
+	}
 }
 
 func TestEnqueueAndInspect(t *testing.T) {
@@ -137,6 +189,74 @@ func TestIdempotencyKey(t *testing.T) {
 	}
 	if job1.ID != job2.ID {
 		t.Errorf("expected same id for idempotent enqueue, got %s vs %s", job1.ID, job2.ID)
+	}
+}
+
+func TestPriorityOrdering(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	low, err := q.Enqueue("test", `{"name":"low"}`, WithPriority(-1))
+	if err != nil {
+		t.Fatalf("enqueue low: %v", err)
+	}
+	defaultPriority, err := q.Enqueue("test", `{"name":"default"}`)
+	if err != nil {
+		t.Fatalf("enqueue default: %v", err)
+	}
+	urgent, err := q.Enqueue("test", `{"name":"urgent"}`, WithPriority(10))
+	if err != nil {
+		t.Fatalf("enqueue urgent: %v", err)
+	}
+	if defaultPriority.Priority != DefaultPriority {
+		t.Fatalf("expected default priority %d, got %d", DefaultPriority, defaultPriority.Priority)
+	}
+
+	ctx := context.Background()
+	for _, want := range []*Job{urgent, defaultPriority, low} {
+		got, err := q.Lease(ctx, "test", time.Minute)
+		if err != nil {
+			t.Fatalf("lease %s: %v", want.ID, err)
+		}
+		if got == nil || got.ID != want.ID {
+			t.Fatalf("expected priority %d job %s, got %+v", want.Priority, want.ID, got)
+		}
+		if err := q.Acknowledge(got.ID); err != nil {
+			t.Fatalf("ack %s: %v", got.ID, err)
+		}
+	}
+}
+
+func TestFutureHighPriorityJobDoesNotBypassSchedule(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	future, err := q.Enqueue("test", `{}`, WithPriority(100), WithRunAt(time.Now().Add(time.Hour)))
+	if err != nil {
+		t.Fatalf("enqueue future: %v", err)
+	}
+	ready, err := q.Enqueue("test", `{}`, WithPriority(0))
+	if err != nil {
+		t.Fatalf("enqueue ready: %v", err)
+	}
+
+	got, err := q.Lease(context.Background(), "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if got == nil || got.ID != ready.ID {
+		t.Fatalf("expected ready job %s, got %+v", ready.ID, got)
+	}
+	if err := q.Acknowledge(got.ID); err != nil {
+		t.Fatalf("ack ready: %v", err)
+	}
+
+	got, err = q.Lease(context.Background(), "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease after ready job: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected scheduled job %s to remain pending, got %+v", future.ID, got)
 	}
 }
 

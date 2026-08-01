@@ -14,6 +14,7 @@ func Enqueue(args []string) error {
 	payload := fs.String("payload", "", "job payload")
 	idempotencyKey := fs.String("idempotency-key", "", "optional idempotency key")
 	maxAttempts := fs.Int("max-attempts", 3, "max attempts, including the first")
+	priority := fs.Int("priority", queue.DefaultPriority, "priority; higher values run first")
 	runAt := fs.String("run-at", "", "earliest lease time as RFC3339")
 	runAfter := fs.Duration("run-after", 0, "delay lease by this duration")
 	dbPath := fs.String("db", "queue.db", "database path")
@@ -33,7 +34,10 @@ func Enqueue(args []string) error {
 	defer store.Close()
 
 	q := queue.NewQueue(store)
-	opts := []queue.EnqueueOption{queue.WithMaxAttempts(*maxAttempts)}
+	opts := []queue.EnqueueOption{
+		queue.WithMaxAttempts(*maxAttempts),
+		queue.WithPriority(*priority),
+	}
 	if *idempotencyKey != "" {
 		opts = append(opts, queue.WithIdempotencyKey(*idempotencyKey))
 	}

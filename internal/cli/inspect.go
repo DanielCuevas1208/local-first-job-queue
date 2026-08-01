@@ -87,8 +87,8 @@ func RenderSnapshot(snap *queue.QueueSnapshot, w io.Writer) {
 			if len(shortID) > 8 {
 				shortID = shortID[:8]
 			}
-			fmt.Fprintf(w, "  %s kind=%s state=%s attempts=%d/%d%s%s\n",
-				shortID, j.Kind, j.State, j.RetryCount, j.MaxAttempts, ik, sched)
+			fmt.Fprintf(w, "  %s kind=%s priority=%d state=%s attempts=%d/%d%s%s\n",
+				shortID, j.Kind, j.Priority, j.State, j.RetryCount, j.MaxAttempts, ik, sched)
 		}
 	}
 }
