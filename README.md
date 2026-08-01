@@ -1,19 +1,22 @@
 # Local-first Durable Job Queue
 
-A durable background job queue with SQLite storage. The queue supports leases, retries, idempotency keys, crash recovery, and an append-only event log.
+A durable background job queue with SQLite storage. It supports leases, retries,
+idempotency keys, crash recovery, and an append-only event log.
 
 ## Architecture
 
-The queue stores jobs in SQLite. A worker leases jobs for exclusive processing. If the worker crashes, expired leases are recovered on the next worker start. Each state change is recorded in an append-only event log.
+The queue stores jobs in SQLite. A worker leases each job for exclusive
+processing. If the worker crashes, the next worker recovers expired leases.
+Each state change is recorded in the event log.
 
 Components:
 
-- `internal/queue` -- Core queue API and SQLite storage.
-- `internal/worker` -- Worker that leases and executes jobs.
-- `internal/fixture` -- Sample data generator.
-- `cmd/enqueue` -- CLI to add jobs.
-- `cmd/inspect` -- CLI to view queue state and events.
-- `cmd/work` -- CLI to start a worker.
+- `internal/queue` — Core queue API and SQLite storage.
+- `internal/worker` — Worker that leases and executes jobs.
+- `internal/fixture` — Sample data generator.
+- `cmd/enqueue` — CLI to add jobs.
+- `cmd/inspect` — CLI to view queue state and events.
+- `cmd/work` — CLI to start a worker.
 
 ## Quick start
 
@@ -135,7 +138,11 @@ Jobs (1)
 
 ## Limitations
 
-The queue uses one writer connection because SQLite serializes writes. A backlog grows when the writer cannot keep up. The store keeps all jobs and events forever; an operator must prune old rows by hand. There is no priority field, so all ready jobs of one kind share one FIFO lane. The worker is a single process and does not coordinate across hosts.
+The queue uses one writer connection because SQLite serializes writes. A backlog
+can grow when the writer cannot keep up. The store keeps all jobs and events
+until an operator removes them. There is no priority field. Ready jobs of one
+kind share one FIFO lane. The worker is one process and does not coordinate
+across hosts.
 
 ## Roadmap
 
