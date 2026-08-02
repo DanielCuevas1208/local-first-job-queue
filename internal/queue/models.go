@@ -18,6 +18,7 @@ type Job struct {
 	State          JobState   `json:"state"`
 	RetryCount     int        `json:"retry_count"`
 	MaxAttempts    int        `json:"max_attempts"`
+	Priority       int        `json:"priority"`
 	IdempotencyKey *string    `json:"idempotency_key,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`

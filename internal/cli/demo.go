@@ -71,20 +71,24 @@ func Demo(args []string) error {
 		name        string
 		payload     string
 		maxAttempts int
+		priority    int
 		runAfter    time.Duration
 	}{
-		{"first-try success", "alpha", `{"name":"alpha"}`, 3, 0},
-		{"retry twice then ok", "beta", `{"name":"beta","fault":{"mode":"error","fail_until_attempt":2,"message":"rate limited"}}`, 3, 0},
-		{"exhausts attempts", "gamma", `{"name":"gamma","fault":{"mode":"error","fail_until_attempt":5,"message":"disk full"}}`, 3, 0},
-		{"panic then ok", "epsilon", `{"name":"epsilon","fault":{"mode":"panic","fail_until_attempt":1,"message":"kaboom"}}`, 2, 0},
-		{"orphaned by a crash", "delta", `{"name":"delta"}`, 3, 0},
-		{"delayed run", "omega", `{"name":"omega"}`, 3, 40 * time.Millisecond},
+		{"first-try success", "alpha", `{"name":"alpha"}`, 3, 0, 0},
+		{"priority retry", "beta", `{"name":"beta","fault":{"mode":"error","fail_until_attempt":2,"message":"rate limited"}}`, 3, 10, 0},
+		{"exhausts attempts", "gamma", `{"name":"gamma","fault":{"mode":"error","fail_until_attempt":5,"message":"disk full"}}`, 3, 0, 0},
+		{"panic then ok", "epsilon", `{"name":"epsilon","fault":{"mode":"panic","fail_until_attempt":1,"message":"kaboom"}}`, 2, 0, 0},
+		{"orphaned by a crash", "delta", `{"name":"delta"}`, 3, 0, 0},
+		{"delayed run", "omega", `{"name":"omega"}`, 3, 0, 40 * time.Millisecond},
 	}
 
 	fmt.Println("enqueuing scenario jobs:")
 	var deltaID string
 	for _, s := range scenario {
-		opts := []queue.EnqueueOption{queue.WithMaxAttempts(s.maxAttempts)}
+		opts := []queue.EnqueueOption{
+			queue.WithMaxAttempts(s.maxAttempts),
+			queue.WithPriority(s.priority),
+		}
 		if s.runAfter > 0 {
 			opts = append(opts, queue.WithRunAfter(s.runAfter))
 		}
@@ -92,7 +96,7 @@ func Demo(args []string) error {
 		if err != nil {
 			return fmt.Errorf("enqueue %s: %w", s.label, err)
 		}
-		fmt.Printf("  %-22s %-22s %s\n", s.label, s.name, job.ID)
+		fmt.Printf("  %-22s %-22s priority=%2d %s\n", s.label, s.name, s.priority, job.ID)
 		if s.name == "delta" {
 			deltaID = job.ID
 		}
