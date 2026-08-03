@@ -1,0 +1,54 @@
+{{define "title"}}Job {{shortID .Job.ID}} - Local-first Job Queue{{end}}
+
+{{define "content"}}
+<section class="panel">
+  <h2>Job {{shortID .Job.ID}}</h2>
+  <table class="detail">
+    <tbody>
+      <tr><th>ID</th><td class="mono">{{.Job.ID}}</td></tr>
+      <tr><th>Kind</th><td>{{.Job.Kind}}</td></tr>
+      <tr><th>State</th><td><span class="{{stateClass .Job.State}}">{{.Job.State}}</span></td></tr>
+      <tr><th>Priority</th><td>{{.Job.Priority}}</td></tr>
+      <tr><th>Attempts</th><td>{{.Job.RetryCount}} / {{.Job.MaxAttempts}}</td></tr>
+      <tr><th>Created (UTC)</th><td>{{utcTime .Job.CreatedAt}}</td></tr>
+      <tr><th>Updated (UTC)</th><td>{{utcTime .Job.UpdatedAt}}</td></tr>
+      {{if .Job.IdempotencyKey}}
+      <tr><th>Idempotency key</th><td class="mono">{{.Job.IdempotencyKey}}</td></tr>
+      {{end}}
+      {{if .Job.LeasedUntil}}
+      <tr><th>Leased until (UTC)</th><td>{{utcTime .Job.LeasedUntil}}</td></tr>
+      {{end}}
+      {{if .Job.RunAt}}
+      <tr><th>Run at (UTC)</th><td>{{utcTime .Job.RunAt}}</td></tr>
+      {{end}}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Payload</h2>
+  <pre class="payload">{{.Job.Payload}}</pre>
+</section>
+
+<section class="panel">
+  <h2>Event timeline</h2>
+  <table>
+    <thead>
+      <tr><th>Time (UTC)</th><th>Event</th><th>Details</th></tr>
+    </thead>
+    <tbody>
+    {{range .Events}}
+      <tr>
+        <td>{{utcTime .Timestamp}}</td>
+        <td><span class="event">{{.EventType}}</span></td>
+        <td class="meta">{{if .Metadata}}{{.Metadata}}{{else}}&ndash;{{end}}</td>
+      </tr>
+    {{else}}
+      <tr><td colspan="3" class="empty">No events recorded.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+
+<p class="back"><a href="/jobs">Back to all jobs</a></p>
+{{end}}

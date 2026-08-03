@@ -2,7 +2,9 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, crash recovery, and priority dispatch.
+
+It also shows priority aging, a dead-letter queue, Prometheus metrics, a web inspection UI, and an append-only event log.
 
 ## Value
 
@@ -22,6 +24,7 @@ The queue separates durable state from worker execution.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
 - `internal/fixture` provides repeatable sample workloads.
+- `internal/web` renders a browser interface and a read-only JSON API.
 
 A job starts as `pending`.
 
@@ -73,6 +76,14 @@ Inspect and requeue a dead-lettered job with these commands.
 go run . history <id> -db queue.db
 go run . requeue <id> -db queue.db
 ```
+
+Browse the queue in a browser with this command.
+
+```text
+go run . web -addr :8080 -db queue.db
+```
+
+Open `http://localhost:8080` to view the dashboard.
 
 ## Commands
 
@@ -153,6 +164,36 @@ The default address is `:9090`.
 Scrape the endpoint with a Prometheus server.
 
 Use `-once` to print one snapshot and exit.
+
+### `web`
+
+```text
+jobqueue web [-addr <addr>] [-db <path>]
+```
+
+The command serves a read-only browser interface.
+
+The default address is `:8080`.
+
+The dashboard shows state counts, per-kind breakdowns, recent events, and recent jobs.
+
+The dashboard auto-refreshes every two seconds.
+
+The jobs page filters the job table by kind and state.
+
+The job page shows one job and its complete event timeline.
+
+The interface never mutates the queue.
+
+Use the `requeue` command to change job state from the terminal.
+
+The JSON API exposes the same views for scripts.
+
+The endpoint `/api/overview` returns the dashboard snapshot.
+
+The endpoint `/api/jobs` returns the filtered job list.
+
+The endpoint `/api/jobs/<id>` returns one job and its events.
 
 ### `demo`
 
@@ -260,6 +301,28 @@ Use the `metrics` command for one snapshot or a live endpoint.
 
 Use `work -metrics-addr` to serve the same endpoint beside a worker.
 
+### Web UI
+
+The `web` command serves a read-only browser interface.
+
+Each page reads the SQLite store directly, so no collection pipeline exists.
+
+The dashboard shows one live view of the queue.
+
+The dashboard auto-refreshes every two seconds.
+
+The jobs page filters by kind and state.
+
+The job page shows the payload and the full event timeline.
+
+The interface is read-only.
+
+Operators keep using the `requeue` command to change job state.
+
+The JSON API supports scripts and other inspection tools.
+
+HTML templates are embedded in the binary, so no asset directory is needed.
+
 ### Scheduling
 
 A scheduled job stores its earliest lease time in `run_at`.
@@ -333,11 +396,49 @@ jobqueue_events_total{type="enqueued"} 5
 jobqueue_events_total{type="retried"} 5
 jobqueue_events_total{type="dead_lettered"} 1
 jobqueue_events_total{type="requeued"} 1
+
+inspect again with: jobqueue inspect -db "..."
+inspect a job with: jobqueue history <id> -db "..."
+requeue a dead letter with: jobqueue requeue <id> -db "..."
+browse the queue with: jobqueue web -db "..."
 ```
 
 The demo uses generated job IDs and current timestamps.
 
 The final counts depend on the scenario and run deadline.
+
+### Web interface
+
+Start the browser view with this command.
+
+```text
+jobqueue web -addr :8080 -db queue.db
+```
+
+```text
+web interface listening on :8080 (db=queue.db)
+open with: http://localhost:8080
+```
+
+Open `http://localhost:8080` in a browser.
+
+The dashboard shows the queue state.
+
+The jobs page filters the job list.
+
+The job page shows one event timeline.
+
+Scrape the JSON API for scripts.
+
+```text
+curl -s http://localhost:8080/api/overview
+```
+
+```text
+{"total":4,"stats":[{"state":"pending","count":2},{"state":"leased","count":0},{"state":"completed","count":1},{"state":"dead_letter","count":1},{"state":"failed","count":0}],"kinds":[...],"events":[...],"jobs":[...]}
+```
+
+The counts in the example come from a seeded database.
 
 ## Verification
 
@@ -376,7 +477,13 @@ A high-priority stream can delay lower-priority jobs until aging lifts them.
 
 The worker is one process and does not coordinate across hosts.
 
-The project does not provide a web interface.
+The web interface is read-only.
+
+Use the `requeue` command to change job state.
+
+The web interface has no authentication.
+
+Bind it to localhost when the database is sensitive.
 
 ## Roadmap
 
@@ -386,12 +493,31 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
-- [ ] Web UI for queue inspection.
+- [x] Read-only web UI for queue inspection.
+- [ ] Browser-based requeue of dead-lettered jobs.
 - [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds a read-only web UI for queue inspection.
+
+The new `web` command serves a browser interface on `:8080` by default.
+
+The dashboard shows state counts, per-kind breakdowns, recent events, and recent jobs.
+
+The dashboard auto-refreshes every two seconds.
+
+The jobs page filters by kind and state.
+
+The job page shows the payload and the full event timeline.
+
+The JSON API exposes the same views for scripts.
+
+The `queue` package now shares one canonical state and event order.
+
+The metrics exporter and the web UI both use the shared order.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 

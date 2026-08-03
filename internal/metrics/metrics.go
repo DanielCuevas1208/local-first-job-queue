@@ -13,29 +13,6 @@ import (
 	"github.com/local-first-job-queue/internal/queue"
 )
 
-// The canonical state order keeps the exposition stable across scrapes. The
-// failed state appears for legacy databases that predate the dead-letter
-// queue, so exporters still report it.
-var stateOrder = []queue.JobState{
-	queue.StatePending,
-	queue.StateLeased,
-	queue.StateCompleted,
-	queue.StateDeadLetter,
-	queue.StateFailed,
-}
-
-var eventTypeOrder = []queue.EventType{
-	queue.EventEnqueued,
-	queue.EventScheduled,
-	queue.EventLeased,
-	queue.EventAcknowledged,
-	queue.EventFailed,
-	queue.EventRetried,
-	queue.EventRecovered,
-	queue.EventDeadLettered,
-	queue.EventRequeued,
-}
-
 // Option configures a Collector.
 type Option func(*Collector)
 
@@ -100,7 +77,7 @@ func (c *Collector) writeStateGauge(w io.Writer, stats map[queue.JobState]int) e
 	if _, err := fmt.Fprintln(w, "# TYPE jobqueue_jobs gauge"); err != nil {
 		return err
 	}
-	for _, state := range stateOrder {
+	for _, state := range queue.StateOrder {
 		if _, err := fmt.Fprintf(w, "jobqueue_jobs{state=%q} %d\n", state, stats[state]); err != nil {
 			return err
 		}
@@ -134,7 +111,7 @@ func (c *Collector) writeEventCounters(w io.Writer, evCounts []queue.EventTypeCo
 	if _, err := fmt.Fprintln(w, "# TYPE jobqueue_events_total counter"); err != nil {
 		return err
 	}
-	for _, et := range eventTypeOrder {
+	for _, et := range queue.EventTypeOrder {
 		if _, err := fmt.Fprintf(w, "jobqueue_events_total{type=%q} %d\n", et, byType[et]); err != nil {
 			return err
 		}

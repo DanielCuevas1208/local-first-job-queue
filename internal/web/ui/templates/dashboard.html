@@ -1,0 +1,139 @@
+{{define "title"}}Dashboard - Local-first Job Queue{{end}}
+
+{{define "content"}}
+<section id="stats" class="stats">
+  {{range .Stats}}
+  <div class="card">
+    <span class="{{stateClass .State}}">{{.State}}</span>
+    <span class="stat-value" data-state="{{.State}}">{{.Count}}</span>
+  </div>
+  {{end}}
+  <div class="card card-total">
+    <span class="label">total</span>
+    <span class="stat-value">{{.Total}}</span>
+  </div>
+</section>
+
+<section class="panel">
+  <h2>Jobs by kind and state</h2>
+  <table>
+    <thead>
+      <tr><th>Kind</th><th>State</th><th>Count</th></tr>
+    </thead>
+    <tbody>
+    {{range .Kinds}}
+      <tr>
+        <td><a href="/jobs?kind={{.Kind}}">{{.Kind}}</a></td>
+        <td><span class="{{stateClass .State}}">{{.State}}</span></td>
+        <td>{{.Count}}</td>
+      </tr>
+    {{else}}
+      <tr><td colspan="3" class="empty">No jobs yet.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Recent events</h2>
+  <table>
+    <thead>
+      <tr><th>Time (UTC)</th><th>Job</th><th>Event</th><th>Details</th></tr>
+    </thead>
+    <tbody id="recent-events">
+    {{range .Events}}
+      <tr>
+        <td>{{utcTime .Timestamp}}</td>
+        <td><a href="/jobs/{{.JobID}}">{{shortID .JobID}}</a></td>
+        <td><span class="event">{{.EventType}}</span></td>
+        <td class="meta">{{if .Metadata}}{{.Metadata}}{{else}}&ndash;{{end}}</td>
+      </tr>
+    {{else}}
+      <tr><td colspan="4" class="empty">No events yet.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+
+<section class="panel">
+  <h2>Recent jobs</h2>
+  <table>
+    <thead>
+      <tr><th>Job</th><th>Kind</th><th>State</th><th>Priority</th><th>Attempts</th><th>Created (UTC)</th></tr>
+    </thead>
+    <tbody>
+    {{range .Jobs}}
+      <tr>
+        <td><a href="/jobs/{{.ID}}">{{shortID .ID}}</a></td>
+        <td>{{.Kind}}</td>
+        <td><span class="{{stateClass .State}}">{{.State}}</span></td>
+        <td>{{.Priority}}</td>
+        <td>{{.RetryCount}}/{{.MaxAttempts}}</td>
+        <td>{{utcTime .CreatedAt}}</td>
+      </tr>
+    {{else}}
+      <tr><td colspan="6" class="empty">No jobs yet.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</section>
+
+<script>
+(function () {
+  var statsEl = document.getElementById('stats');
+  var eventsEl = document.getElementById('recent-events');
+  if (!statsEl) return;
+
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function fmt(ts) {
+    var d = new Date(ts);
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) +
+      ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds()) + ' UTC';
+  }
+  function shortId(id) { return id.length > 8 ? id.slice(0, 8) : id; }
+  function meta(m) { return m ? m.slice(0, 48) : '\u2013'; }
+  function cell(tr, text) {
+    var td = document.createElement('td');
+    td.textContent = text;
+    tr.appendChild(td);
+  }
+  function renderEvents(events) {
+    if (!eventsEl) return;
+    eventsEl.textContent = '';
+    if (!events || events.length === 0) {
+      var tr = document.createElement('tr');
+      var td = document.createElement('td');
+      td.className = 'empty';
+      td.colSpan = 4;
+      td.textContent = 'No events yet.';
+      tr.appendChild(td);
+      eventsEl.appendChild(tr);
+      return;
+    }
+    events.forEach(function (e) {
+      var tr = document.createElement('tr');
+      cell(tr, fmt(e.timestamp));
+      cell(tr, shortId(e.job_id));
+      cell(tr, e.event_type);
+      cell(tr, meta(e.metadata));
+      eventsEl.appendChild(tr);
+    });
+  }
+  function refresh() {
+    fetch('/api/overview', { cache: 'no-store' })
+      .then(function (res) { return res.json(); })
+      .then(function (data) {
+        var total = 0;
+        data.stats.forEach(function (s) {
+          var el = statsEl.querySelector('[data-state="' + s.state + '"]');
+          if (el) el.textContent = s.count;
+          total += s.count;
+        });
+        renderEvents(data.events);
+      })
+      .catch(function () {});
+  }
+  setInterval(refresh, 2000);
+})();
+</script>
+{{end}}

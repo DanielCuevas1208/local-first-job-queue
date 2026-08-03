@@ -46,6 +46,32 @@ const (
 	EventRequeued     EventType = "requeued"
 )
 
+// StateOrder lists the job states in canonical display order. Exporters,
+// the web UI, and the inspect command share this order so every consumer
+// renders state consistently. The failed state appears for legacy databases
+// that predate the dead-letter queue.
+var StateOrder = []JobState{
+	StatePending,
+	StateLeased,
+	StateCompleted,
+	StateDeadLetter,
+	StateFailed,
+}
+
+// EventTypeOrder lists the event types in canonical display order. It is the
+// shared order for event counts, keeping exports stable across consumers.
+var EventTypeOrder = []EventType{
+	EventEnqueued,
+	EventScheduled,
+	EventLeased,
+	EventAcknowledged,
+	EventFailed,
+	EventRetried,
+	EventRecovered,
+	EventDeadLettered,
+	EventRequeued,
+}
+
 type Event struct {
 	ID        int64     `json:"id"`
 	JobID     string    `json:"job_id"`
@@ -66,6 +92,14 @@ type KindStateCount struct {
 	Kind  string   `json:"kind"`
 	State JobState `json:"state"`
 	Count int      `json:"count"`
+}
+
+// JobFilter narrows a ListJobs call. Empty Kind and State fields match any
+// value. A zero Limit returns up to DefaultListLimit jobs.
+type JobFilter struct {
+	Kind  string   `json:"kind,omitempty"`
+	State JobState `json:"state,omitempty"`
+	Limit int      `json:"limit,omitempty"`
 }
 
 // EventTypeCount reports how many events share one event type. The count is

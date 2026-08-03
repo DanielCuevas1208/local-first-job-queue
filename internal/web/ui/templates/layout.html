@@ -1,0 +1,26 @@
+{{define "layout"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{block "title" .}}Local-first Job Queue{{end}}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">Local-first Job Queue</a>
+  <nav>
+    <a href="/">Dashboard</a>
+    <a href="/jobs">Jobs</a>
+  </nav>
+</header>
+<main>
+{{template "content" .}}
+</main>
+<footer>
+  <p>Read-only view. Use <code>jobqueue requeue &lt;id&gt;</code> to return a dead-lettered job to the queue.</p>
+</footer>
+</body>
+</html>
+{{end}}

@@ -994,6 +994,150 @@ func TestFullLifecycle(t *testing.T) {
 	}
 }
 
+// TestListJobsFilters verifies that ListJobs narrows jobs by kind and state,
+// orders them newest first, and honors the limit. The web UI depends on this
+// method for its jobs page and API. The jobs are backdated with explicit times
+// so the expected order does not depend on platform clock resolution.
+func TestListJobsFilters(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	first, err := q.Enqueue("email", `{"n":1}`)
+	if err != nil {
+		t.Fatalf("enqueue email: %v", err)
+	}
+	report, err := q.Enqueue("report", `{"n":2}`)
+	if err != nil {
+		t.Fatalf("enqueue report: %v", err)
+	}
+	cleanup, err := q.Enqueue("email", `{"n":3}`)
+	if err != nil {
+		t.Fatalf("enqueue cleanup: %v", err)
+	}
+	base := time.Now().UTC()
+	backdate := func(id string, ago time.Duration) {
+		t.Helper()
+		if _, err := s.db.Exec(
+			`UPDATE jobs SET created_at = ? WHERE id = ?`,
+			base.Add(-ago).Format(sqliteTimeFormat), id); err != nil {
+			t.Fatalf("backdate %s: %v", id, err)
+		}
+	}
+	backdate(first.ID, 3*time.Second)
+	backdate(report.ID, 2*time.Second)
+	backdate(cleanup.ID, time.Second)
+
+	// The full list is newest first.
+	all, err := s.ListJobs(JobFilter{})
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 jobs, got %d", len(all))
+	}
+	if all[0].ID != cleanup.ID || all[1].ID != report.ID || all[2].ID != first.ID {
+		t.Errorf("expected newest-first order, got %+v", all)
+	}
+
+	// A kind filter returns only that kind.
+	emails, err := s.ListJobs(JobFilter{Kind: "email"})
+	if err != nil {
+		t.Fatalf("list emails: %v", err)
+	}
+	if len(emails) != 2 {
+		t.Fatalf("expected 2 email jobs, got %d", len(emails))
+	}
+	for _, j := range emails {
+		if j.Kind != "email" {
+			t.Errorf("expected email kind, got %s", j.Kind)
+		}
+	}
+
+	// A limit caps the result.
+	limited, err := s.ListJobs(JobFilter{Limit: 1})
+	if err != nil {
+		t.Fatalf("list limited: %v", err)
+	}
+	if len(limited) != 1 || limited[0].ID != cleanup.ID {
+		t.Errorf("expected the newest job only, got %+v", limited)
+	}
+}
+
+// TestListJobsStateFilter verifies that ListJobs narrows jobs by state and
+// that an unknown state matches nothing.
+func TestListJobsStateFilter(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	job, err := q.Enqueue("test", `{}`)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	leased, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil || leased == nil {
+		t.Fatalf("lease: %v %v", leased, err)
+	}
+	if err := q.Acknowledge(leased.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+
+	pending, err := s.ListJobs(JobFilter{State: StatePending})
+	if err != nil {
+		t.Fatalf("list pending: %v", err)
+	}
+	completed, err := s.ListJobs(JobFilter{State: StateCompleted})
+	if err != nil {
+		t.Fatalf("list completed: %v", err)
+	}
+	missing, err := s.ListJobs(JobFilter{State: StateDeadLetter})
+	if err != nil {
+		t.Fatalf("list dead letter: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected no pending jobs, got %+v", pending)
+	}
+	if len(completed) != 1 || completed[0].ID != job.ID {
+		t.Errorf("expected the completed job, got %+v", completed)
+	}
+	if len(missing) != 0 {
+		t.Errorf("expected no dead-letter jobs, got %+v", missing)
+	}
+}
+
+// TestListKinds verifies that ListKinds returns every distinct job kind sorted
+// by name, and that an empty queue yields no kinds.
+func TestListKinds(t *testing.T) {
+	s := newTestStore(t)
+	kinds, err := s.ListKinds()
+	if err != nil {
+		t.Fatalf("list kinds: %v", err)
+	}
+	if len(kinds) != 0 {
+		t.Fatalf("expected no kinds on an empty queue, got %+v", kinds)
+	}
+
+	q := NewQueue(s)
+	for _, kind := range []string{"report", "email", "cleanup"} {
+		if _, err := q.Enqueue(kind, `{}`); err != nil {
+			t.Fatalf("enqueue %s: %v", kind, err)
+		}
+	}
+	kinds, err = s.ListKinds()
+	if err != nil {
+		t.Fatalf("list kinds: %v", err)
+	}
+	want := []string{"cleanup", "email", "report"}
+	if len(kinds) != len(want) {
+		t.Fatalf("expected %d kinds, got %+v", len(want), kinds)
+	}
+	for i := range want {
+		if kinds[i] != want[i] {
+			t.Errorf("kind %d: expected %s, got %s", i, want[i], kinds[i])
+		}
+	}
+}
+
 func BenchmarkEnqueue(b *testing.B) {
 	s, err := NewSQLiteStore("file:bench_enqueue?mode=memory&cache=shared")
 	if err != nil {

@@ -208,6 +208,7 @@ func Demo(args []string) error {
 	fmt.Printf("\ninspect again with: jobqueue inspect -db %q\n", path)
 	fmt.Printf("inspect a job with: jobqueue history <id> -db %q\n", path)
 	fmt.Printf("requeue a dead letter with: jobqueue requeue <id> -db %q\n", path)
+	fmt.Printf("browse the queue with: jobqueue web -db %q\n", path)
 	return nil
 }
 

@@ -3,6 +3,7 @@ package queue
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -452,6 +453,44 @@ func (s *SQLiteStore) GetAllJobs() ([]Job, error) {
 	return s.queryJobs(`ORDER BY created_at DESC`)
 }
 
+// DefaultListLimit is the number of jobs a ListJobs call returns when the
+// filter does not set a limit. The web UI uses this value to keep each page
+// bounded, even when the queue holds thousands of jobs.
+const DefaultListLimit = 200
+
+// ListJobs returns jobs that match a JobFilter, newest first. An empty filter
+// lists every job. A zero filter limit falls back to DefaultListLimit, and a
+// negative limit lists all rows. The result order is deterministic: created_at
+// descending, then id descending as a tie breaker.
+func (s *SQLiteStore) ListJobs(f JobFilter) ([]Job, error) {
+	clauses := []string{}
+	args := []any{}
+	if f.State != "" {
+		clauses = append(clauses, "state = ?")
+		args = append(args, string(f.State))
+	}
+	if f.Kind != "" {
+		clauses = append(clauses, "kind = ?")
+		args = append(args, f.Kind)
+	}
+	where := ""
+	if len(clauses) > 0 {
+		where = "WHERE " + strings.Join(clauses, " AND ")
+	}
+	limit := f.Limit
+	switch {
+	case limit == 0:
+		limit = DefaultListLimit
+	case limit < 0:
+		limit = 0
+	}
+	query := where + " ORDER BY created_at DESC, id DESC"
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d", limit)
+	}
+	return s.queryJobs(query, args...)
+}
+
 func (s *SQLiteStore) queryJobs(where string, args ...any) ([]Job, error) {
 	rows, err := s.db.Query(
 		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
@@ -489,6 +528,26 @@ func (s *SQLiteStore) GetQueueStats() (map[JobState]int, error) {
 		stats[JobState(state)] = count
 	}
 	return stats, nil
+}
+
+// ListKinds returns every job kind that appears in the queue, sorted by name.
+// The web UI uses the list to build filter options.
+func (s *SQLiteStore) ListKinds() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT kind FROM jobs ORDER BY kind`)
+	if err != nil {
+		return nil, fmt.Errorf("query kinds: %w", err)
+	}
+	defer rows.Close()
+
+	var kinds []string
+	for rows.Next() {
+		var kind string
+		if err := rows.Scan(&kind); err != nil {
+			return nil, fmt.Errorf("scan kind: %w", err)
+		}
+		kinds = append(kinds, kind)
+	}
+	return kinds, nil
 }
 
 // GetStateKindCounts returns the number of jobs for each (kind, state) pair.
