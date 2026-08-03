@@ -2,7 +2,9 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, and an append-only event log.
+
+It also exposes Prometheus metrics and a read-only web dashboard.
 
 ## Value
 
@@ -21,6 +23,7 @@ The queue separates durable state from worker execution.
 - `internal/fault` injects deterministic errors, panics, delays, and stalls.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
+- `internal/dashboard` serves a read-only web interface and JSON endpoints.
 - `internal/fixture` provides repeatable sample workloads.
 
 A job starts as `pending`.
@@ -102,6 +105,14 @@ Use `-aging 0` to disable aging.
 
 Use `-metrics-addr` to serve Prometheus metrics beside the worker.
 
+Serve the inspection dashboard with this command.
+
+```text
+jobqueue web -db queue.db
+```
+
+Open `http://localhost:8080` in a browser.
+
 ### `inspect`
 
 ```text
@@ -153,6 +164,38 @@ The default address is `:9090`.
 Scrape the endpoint with a Prometheus server.
 
 Use `-once` to print one snapshot and exit.
+
+### `web`
+
+```text
+jobqueue web [-addr <addr>] [-refresh <duration>] [-db <path>]
+```
+
+The command serves a read-only inspection dashboard.
+
+The dashboard renders state counts, jobs, and recent events in one page.
+
+The page refreshes in place, so it needs no reload.
+
+Use `-addr` to change the listen address.
+
+The default address is `:8080`.
+
+Use `-refresh` to set the auto-refresh interval.
+
+The default interval is two seconds.
+
+The page links to the Prometheus endpoint at `/metrics`.
+
+The command never writes to the queue.
+
+JSON endpoints expose the same state to scripts.
+
+`GET /api/overview` returns the full snapshot.
+
+`GET /api/jobs` returns every job.
+
+`GET /api/jobs/<id>` returns one job and its event timeline.
 
 ### `demo`
 
@@ -259,6 +302,22 @@ The output order stays stable across scrapes.
 Use the `metrics` command for one snapshot or a live endpoint.
 
 Use `work -metrics-addr` to serve the same endpoint beside a worker.
+
+### Web dashboard
+
+The `web` command serves a read-only dashboard in a browser.
+
+The page shows state counts, jobs, recent events, and per-kind totals.
+
+The page refreshes in place every two seconds.
+
+Each refresh reads the SQLite store and renders a fresh snapshot.
+
+The dashboard is read-only and never modifies the queue.
+
+JSON endpoints back the page and support scripts.
+
+The `/metrics` endpoint works beside the dashboard.
 
 ### Scheduling
 
@@ -376,7 +435,7 @@ A high-priority stream can delay lower-priority jobs until aging lifts them.
 
 The worker is one process and does not coordinate across hosts.
 
-The project does not provide a web interface.
+The dashboard serves the queue read-only, so it does not run jobs.
 
 ## Roadmap
 
@@ -386,12 +445,24 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
-- [ ] Web UI for queue inspection.
+- [x] Web dashboard for queue inspection.
 - [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds a read-only web dashboard.
+
+The new `web` command serves one HTML page and JSON endpoints.
+
+The page shows state counts, jobs, recent events, and per-kind totals.
+
+It refreshes in place, so it needs no reload.
+
+Scripts can read the same state from `/api/overview`.
+
+The dashboard never writes to the queue.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 
