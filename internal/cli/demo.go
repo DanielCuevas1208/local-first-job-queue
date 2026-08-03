@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/local-first-job-queue/internal/fault"
+	"github.com/local-first-job-queue/internal/metrics"
 	"github.com/local-first-job-queue/internal/queue"
 	"github.com/local-first-job-queue/internal/worker"
 )
@@ -21,15 +22,23 @@ import (
 // The scenario covers:
 //   - a job that completes on the first attempt,
 //   - a job that fails twice and then succeeds,
-//   - a job that exhausts its attempts and enters the failed state,
+//   - a job that exhausts its attempts and enters the dead-letter queue,
 //   - a job that panics on the first attempt and succeeds on the second,
 //   - a job that a previous worker leased and abandoned, to show crash
 //     recovery on the next worker start.
+//
+// After the first worker run, the demo requeues the dead-lettered job with a
+// corrected payload and runs the worker again. The requeued job completes, so
+// the output shows the full dead-letter workflow.
+//
+// A short separate segment shows priority aging: a low-priority job scheduled
+// in the past overtakes a fresher higher-priority job because it has waited
+// for several aging intervals.
 func Demo(args []string) error {
 	fs := flag.NewFlagSet("demo", flag.ExitOnError)
 	dbPath := fs.String("db", "", "database path (default: a temp file)")
 	keep := fs.Bool("keep", false, "keep the demo database file after the run")
-	maxRun := fs.Duration("run", 3*time.Second, "maximum time the worker runs")
+	maxRun := fs.Duration("run", 3*time.Second, "maximum time each worker run lasts")
 	kind := fs.String("kind", "demo", "job kind used by the demo")
 	fs.Parse(args)
 
@@ -76,14 +85,14 @@ func Demo(args []string) error {
 	}{
 		{"first-try success", "alpha", `{"name":"alpha"}`, 3, 0, 0},
 		{"priority retry", "beta", `{"name":"beta","fault":{"mode":"error","fail_until_attempt":2,"message":"rate limited"}}`, 3, 10, 0},
-		{"exhausts attempts", "gamma", `{"name":"gamma","fault":{"mode":"error","fail_until_attempt":5,"message":"disk full"}}`, 3, 0, 0},
+		{"exhausts attempts", "gamma", `{"name":"gamma","fault":{"mode":"error","fail_until_attempt":3,"message":"disk full"}}`, 3, 0, 0},
 		{"panic then ok", "epsilon", `{"name":"epsilon","fault":{"mode":"panic","fail_until_attempt":1,"message":"kaboom"}}`, 2, 0, 0},
 		{"orphaned by a crash", "delta", `{"name":"delta"}`, 3, 0, 0},
 		{"delayed run", "omega", `{"name":"omega"}`, 3, 0, 40 * time.Millisecond},
 	}
 
 	fmt.Println("enqueuing scenario jobs:")
-	var deltaID string
+	var deltaID, gammaID string
 	for _, s := range scenario {
 		opts := []queue.EnqueueOption{
 			queue.WithMaxAttempts(s.maxAttempts),
@@ -97,8 +106,11 @@ func Demo(args []string) error {
 			return fmt.Errorf("enqueue %s: %w", s.label, err)
 		}
 		fmt.Printf("  %-22s %-22s priority=%2d %s\n", s.label, s.name, s.priority, job.ID)
-		if s.name == "delta" {
+		switch s.name {
+		case "delta":
 			deltaID = job.ID
+		case "gamma":
+			gammaID = job.ID
 		}
 	}
 
@@ -115,37 +127,152 @@ func Demo(args []string) error {
 		log.Printf("handled name=%s attempt=%d state-before=%s", payloadName(job.Payload), job.RetryCount+1, job.State)
 		return nil
 	}
-	w := worker.NewWorker(q, fault.New(inner, fault.FromPayload).Handle, *kind,
-		worker.WithConcurrency(1),
-		worker.WithPollInterval(5*time.Millisecond),
-		worker.WithLeaseDuration(2*time.Second),
-	)
+	newWorker := func() *worker.Worker {
+		return worker.NewWorker(q, fault.New(inner, fault.FromPayload).Handle, *kind,
+			worker.WithConcurrency(1),
+			worker.WithPollInterval(5*time.Millisecond),
+			worker.WithLeaseDuration(2*time.Second),
+		)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), *maxRun)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- w.Run(ctx) }()
+	runWorker := func() bool {
+		w := newWorker()
+		ctx, cancel := context.WithTimeout(context.Background(), *maxRun)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- w.Run(ctx) }()
+		idle := waitUntilIdle(q, 20*time.Millisecond, ctx.Done())
+		cancel()
+		<-done
+		return idle
+	}
 
-	idle := waitUntilIdle(q, 20*time.Millisecond, ctx.Done())
-	cancel()
-	<-done
-
-	if idle {
-		fmt.Println("\nqueue drained before the run deadline.")
+	if runWorker() {
+		fmt.Println("queue drained before the run deadline.")
 	} else {
-		fmt.Println("\nreached the run deadline before the queue drained.")
+		fmt.Println("reached the run deadline before the queue drained.")
+	}
+
+	// gamma exhausted its attempts during the first run. Show the dead-letter
+	// queue, then requeue gamma with a corrected payload and run the worker
+	// again so the job completes.
+	fmt.Println("\nDead-letter queue")
+	fmt.Println("-----------------")
+	snap, err := q.Inspect()
+	if err != nil {
+		return fmt.Errorf("inspect: %w", err)
+	}
+	deadLetterCount := 0
+	for _, j := range snap.Jobs {
+		if j.State == queue.StateDeadLetter {
+			fmt.Printf("  %s kind=%s priority=%d state=%s attempts=%d/%d\n",
+				shortID(j.ID), j.Kind, j.Priority, j.State, j.RetryCount, j.MaxAttempts)
+			deadLetterCount++
+		}
+	}
+	if deadLetterCount == 0 {
+		fmt.Println("  (empty)")
+	}
+
+	fmt.Println("\noperator requeues the dead-lettered job with a corrected payload.")
+	if _, err := q.Requeue(gammaID, queue.RequeueWithPayload(`{"name":"gamma","fixed":true}`)); err != nil {
+		return fmt.Errorf("requeue gamma: %w", err)
+	}
+	fmt.Println("starting worker again; it will process the requeued job.")
+	fmt.Println()
+
+	if runWorker() {
+		fmt.Println("queue drained before the run deadline.")
+	} else {
+		fmt.Println("reached the run deadline before the queue drained.")
+	}
+
+	if err := showPriorityAging(*kind); err != nil {
+		return err
 	}
 
 	fmt.Println()
-	snap, err := q.Inspect()
+	snap, err = q.Inspect()
 	if err != nil {
 		return fmt.Errorf("inspect: %w", err)
 	}
 	RenderSnapshot(snap, os.Stdout)
 
+	fmt.Println()
+	fmt.Println("Metrics")
+	fmt.Println("-------")
+	if err := metrics.New(store).Write(os.Stdout); err != nil {
+		return fmt.Errorf("render metrics: %w", err)
+	}
+
 	fmt.Printf("\ninspect again with: jobqueue inspect -db %q\n", path)
 	fmt.Printf("inspect a job with: jobqueue history <id> -db %q\n", path)
+	fmt.Printf("requeue a dead letter with: jobqueue requeue <id> -db %q\n", path)
 	return nil
+}
+
+// showPriorityAging demonstrates that a job gains one priority point per aging
+// interval it has waited. A low-priority job scheduled in the past has a higher
+// effective priority than a fresher higher-priority job, so it leases first.
+// The segment uses its own in-memory store so it does not disturb the scenario
+// counts.
+func showPriorityAging(kind string) error {
+	const agingInterval = 100 * time.Millisecond
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-aging?mode=memory&cache=shared",
+		queue.WithAgingInterval(agingInterval))
+	if err != nil {
+		return fmt.Errorf("open aging store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+
+	fmt.Println("\nPriority aging")
+	fmt.Println("--------------")
+	fmt.Printf("aging interval: %s; a job gains one priority point per interval it waits.\n", agingInterval)
+
+	aged, err := q.Enqueue(kind, `{"name":"aged"}`, queue.WithPriority(0), queue.WithRunAt(time.Now().Add(-5*agingInterval)))
+	if err != nil {
+		return fmt.Errorf("enqueue aged: %w", err)
+	}
+	fresh, err := q.Enqueue(kind, `{"name":"fresh"}`, queue.WithPriority(1))
+	if err != nil {
+		return fmt.Errorf("enqueue fresh: %w", err)
+	}
+	fmt.Printf("  %-22s priority=%2d waited=5 intervals effective=%d\n",
+		"aged  (low priority)", 0, effectivePriority(*aged, agingInterval))
+	fmt.Printf("  %-22s priority=%2d waited=0 intervals effective=%d\n",
+		"fresh (high priority)", 1, effectivePriority(*fresh, agingInterval))
+	fmt.Println()
+
+	ctx := context.Background()
+	first, err := q.Lease(ctx, kind, time.Minute)
+	if err != nil {
+		return fmt.Errorf("lease first: %w", err)
+	}
+	second, err := q.Lease(ctx, kind, time.Minute)
+	if err != nil {
+		return fmt.Errorf("lease second: %w", err)
+	}
+	if first == nil || second == nil {
+		return fmt.Errorf("expected two leases in the aging demo")
+	}
+	if first.ID != aged.ID {
+		return fmt.Errorf("aging demo: expected aged job to lease first")
+	}
+	if second.ID != fresh.ID {
+		return fmt.Errorf("aging demo: expected fresh job to lease second")
+	}
+	fmt.Printf("lease order: %s (%s) then %s (%s)\n",
+		shortID(first.ID), payloadName(first.Payload), shortID(second.ID), payloadName(second.Payload))
+	fmt.Println("the waiting job outranks the fresher higher-priority job.")
+	return nil
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
 }
 
 func payloadName(payload string) string {
@@ -160,6 +287,21 @@ func payloadName(payload string) string {
 		return "?"
 	}
 	return payload[i : i+j]
+}
+
+// effectivePriority reports the priority the lease query would use for a job,
+// including the aging boost it has earned by waiting. The store measures the
+// wait from COALESCE(run_at, created_at), mirroring the SQL ordering clause.
+func effectivePriority(j queue.Job, interval time.Duration) int {
+	ready := j.CreatedAt
+	if j.RunAt != nil {
+		ready = *j.RunAt
+	}
+	waited := time.Since(ready)
+	if waited < 0 {
+		waited = 0
+	}
+	return j.Priority + int(waited/interval)
 }
 
 // waitUntilIdle returns true when the queue has no pending and no leased jobs.
