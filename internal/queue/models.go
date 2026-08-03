@@ -74,3 +74,18 @@ type EventTypeCount struct {
 	EventType EventType `json:"event_type"`
 	Count     int       `json:"count"`
 }
+
+// JobFilter selects one page of jobs from the store. A zero-value filter
+// returns the first page of every job, newest first. Limit is capped at 500;
+// a limit of zero or less uses 100. The web dashboard and inspection tools use
+// this filter to render a bounded job table.
+type JobFilter struct {
+	// State, when non-nil, limits the result to one job state.
+	State *JobState `json:"state,omitempty"`
+	// Kind limits the result to one job kind. An empty kind matches every kind.
+	Kind string `json:"kind,omitempty"`
+	// Limit is the maximum number of jobs on the page.
+	Limit int `json:"limit,omitempty"`
+	// Offset skips this many matching jobs before the page.
+	Offset int `json:"offset,omitempty"`
+}

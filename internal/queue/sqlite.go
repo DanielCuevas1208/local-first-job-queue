@@ -3,6 +3,7 @@ package queue
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -450,6 +451,63 @@ func (s *SQLiteStore) GetLeasedJobs() ([]Job, error) {
 
 func (s *SQLiteStore) GetAllJobs() ([]Job, error) {
 	return s.queryJobs(`ORDER BY created_at DESC`)
+}
+
+// ListJobs returns one page of jobs that match f, ordered newest first. The
+// order adds the job ID as a tie breaker, so pages stay stable across calls.
+// The returned total is the number of matching jobs before pagination, so a
+// caller can render a pager. Limit is capped at 500; zero or negative uses 100.
+func (s *SQLiteStore) ListJobs(f JobFilter) ([]Job, int, error) {
+	var conds []string
+	var args []any
+	if f.State != nil {
+		conds = append(conds, "state = ?")
+		args = append(args, string(*f.State))
+	}
+	if f.Kind != "" {
+		conds = append(conds, "kind = ?")
+		args = append(args, f.Kind)
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+
+	var total int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs`+where, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count jobs: %w", err)
+	}
+
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	pageArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := s.db.Query(
+		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+		 FROM jobs`+where+` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`, pageArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var jobs []Job
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, 0, fmt.Errorf("scan job: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, total, nil
 }
 
 func (s *SQLiteStore) queryJobs(where string, args ...any) ([]Job, error) {

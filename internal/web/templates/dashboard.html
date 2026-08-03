@@ -1,0 +1,129 @@
+{{define "title"}}Dashboard &middot; Local-first Durable Job Queue{{end}}
+
+{{define "content"}}
+<section class="state-cards">
+  {{range .StateCards}}
+  <a class="card state-{{asString .State}}{{if .Active}} active{{end}}" href="{{.URL}}">
+    <span class="card-label">{{asString .State}}</span>
+    <span class="card-count">{{.Count}}</span>
+  </a>
+  {{end}}
+</section>
+
+<section class="panel">
+  <h2>Jobs</h2>
+  <form class="filter-bar" method="get" action="/">
+    <label>State
+      <select name="state">
+        <option value="">all</option>
+        {{range stateOptions}}
+        <option value="{{.}}" {{if eq $.State .}}selected{{end}}>{{.}}</option>
+        {{end}}
+      </select>
+    </label>
+    <label>Kind
+      <input type="text" name="kind" value="{{.Kind}}" placeholder="email">
+    </label>
+    <button type="submit">Filter</button>
+    {{if .Filtered}}<a class="button ghost" href="{{.ClearURL}}">Clear</a>{{end}}
+  </form>
+
+  {{if eq (len .Jobs) 0}}
+  <p class="empty">No jobs match these filters.</p>
+  {{else}}
+  <table class="jobs">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>Kind</th>
+        <th>Priority</th>
+        <th>State</th>
+        <th>Attempts</th>
+        <th>Run at</th>
+        <th>Created</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Jobs}}
+      <tr>
+        <td><a href="/jobs/{{.ID}}">{{shortID .ID}}</a></td>
+        <td>{{.Kind}}</td>
+        <td class="num">{{.Priority}}</td>
+        <td><span class="badge state-{{asString .State}}">{{asString .State}}</span></td>
+        <td class="num">{{.RetryCount}} / {{.MaxAttempts}}</td>
+        <td>{{if .RunAt}}{{formatTime .RunAt}}{{else}}now{{end}}</td>
+        <td>{{formatTime .CreatedAt}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  <div class="pager">
+    {{if .ShowPrev}}<a class="button" href="{{.PrevURL}}">&larr; Newer</a>{{else}}<span class="button disabled">&larr; Newer</span>{{end}}
+    <span class="pager-info">
+      {{if eq .Total 0}}0 jobs{{else}}Showing {{.FirstItem}}&ndash;{{.LastItem}} of {{.Total}}{{end}}
+    </span>
+    {{if .ShowNext}}<a class="button" href="{{.NextURL}}">Older &rarr;</a>{{else}}<span class="button disabled">Older &rarr;</span>{{end}}
+  </div>
+  {{end}}
+</section>
+
+<section class="panel">
+  <h2>Kinds</h2>
+  {{if eq (len .Kinds) 0}}
+  <p class="empty">No jobs yet.</p>
+  {{else}}
+  <table class="kinds">
+    <thead>
+      <tr>
+        <th>Kind</th>
+        <th>Pending</th>
+        <th>Leased</th>
+        <th>Completed</th>
+        <th>Dead letter</th>
+        <th>Failed</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Kinds}}
+      <tr>
+        <td><a href="/?kind={{.Kind}}">{{.Kind}}</a></td>
+        <td class="num">{{index .Counts "pending"}}</td>
+        <td class="num">{{index .Counts "leased"}}</td>
+        <td class="num">{{index .Counts "completed"}}</td>
+        <td class="num">{{index .Counts "dead_letter"}}</td>
+        <td class="num">{{index .Counts "failed"}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{end}}
+</section>
+
+<section class="panel">
+  <h2>Recent events</h2>
+  {{if eq (len .Events) 0}}
+  <p class="empty">The event log is empty.</p>
+  {{else}}
+  <table class="events">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Job</th>
+        <th>Type</th>
+        <th>Detail</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Events}}
+      <tr>
+        <td>{{formatTime .Timestamp}}</td>
+        <td><a href="/jobs/{{.JobID}}">{{shortID .JobID}}</a></td>
+        <td><span class="badge event-{{asString .EventType}}">{{asString .EventType}}</span></td>
+        <td class="meta">{{if .Metadata}}{{.Metadata}}{{else}}&ndash;{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{end}}
+</section>
+{{end}}

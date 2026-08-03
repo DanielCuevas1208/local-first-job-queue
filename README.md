@@ -2,7 +2,9 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, and a dead-letter queue.
+
+An append-only event log, Prometheus metrics, and a web dashboard expose the queue state.
 
 ## Value
 
@@ -21,6 +23,7 @@ The queue separates durable state from worker execution.
 - `internal/fault` injects deterministic errors, panics, delays, and stalls.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
+- `internal/web` serves the dashboard, its JSON API, and Prometheus metrics.
 - `internal/fixture` provides repeatable sample workloads.
 
 A job starts as `pending`.
@@ -44,7 +47,12 @@ go build -o jobqueue .
 ./jobqueue enqueue -kind email -payload '{"to":"user@example.com"}' -priority 20
 ./jobqueue work -kind email
 ./jobqueue inspect
+./jobqueue serve
 ```
+
+Open `http://localhost:8080` in a browser.
+
+The web dashboard lists the same state as `inspect`.
 
 Use `-priority` to place urgent work ahead of normal work.
 
@@ -154,6 +162,28 @@ Scrape the endpoint with a Prometheus server.
 
 Use `-once` to print one snapshot and exit.
 
+### `serve`
+
+```text
+jobqueue serve [-addr <addr>] [-db <path>]
+```
+
+The command serves the web dashboard for queue inspection.
+
+The default address is `:8080`.
+
+The server embeds its templates and styles, so the binary is self-contained.
+
+Open the printed address in a browser.
+
+The dashboard shows queue state, filters jobs, and pages through them.
+
+A job page shows the full event timeline for one job.
+
+The server exposes Prometheus metrics at `/metrics`.
+
+A JSON API at `/api` supports scripts.
+
 ### `demo`
 
 ```text
@@ -260,6 +290,36 @@ Use the `metrics` command for one snapshot or a live endpoint.
 
 Use `work -metrics-addr` to serve the same endpoint beside a worker.
 
+### Web dashboard
+
+The web dashboard shows queue state at a glance.
+
+State cards summarize pending, leased, completed, and dead-lettered jobs.
+
+The jobs table filters by state and kind and pages through large queues.
+
+The job page shows one job and its complete event timeline.
+
+An operator requeues a dead-lettered job with a corrected payload.
+
+The dashboard is read-only apart from requeue.
+
+A JSON API serves the same data to scripts.
+
+The API offers these endpoints.
+
+`GET /api/stats` returns counts, kind totals, and recent events.
+
+`GET /api/jobs` lists jobs with state, kind, limit, and offset filters.
+
+`GET /api/jobs/<id>` returns one job.
+
+`GET /api/jobs/<id>/events` returns one job's timeline.
+
+`POST /api/jobs/<id>/requeue` returns a dead-lettered job to `pending`.
+
+The server also serves Prometheus metrics at `/metrics`.
+
 ### Scheduling
 
 A scheduled job stores its earliest lease time in `run_at`.
@@ -339,6 +399,35 @@ The demo uses generated job IDs and current timestamps.
 
 The final counts depend on the scenario and run deadline.
 
+Run `jobqueue serve -db queue.db` to inspect the queue in a browser.
+
+The command prints its address and serves the dashboard.
+
+```text
+$ jobqueue serve -db queue.db
+web dashboard: http://localhost:8080 (db=queue.db)
+```
+
+Open `http://localhost:8080` to see the dashboard.
+
+The JSON API exposes the same state to scripts.
+
+```text
+$ curl -s localhost:8080/api/stats
+{
+  "stats": {
+    "pending": 1
+  },
+  "by_kind": [
+    {
+      "kind": "email",
+      "state": "pending",
+      "count": 1
+    }
+  ]
+}
+```
+
 ## Verification
 
 Run the full test suite with this command.
@@ -360,7 +449,7 @@ Run queue benchmarks with this command.
 go test ./internal/queue -run '^$' -bench Benchmark -benchmem -count=1
 ```
 
-Verification status: tests, vet, build, and benchmarks pass locally and in CI.
+Verification status: tests, vet, build, benchmarks, and the demo smoke run pass locally and in CI.
 
 Race tests run in CI on Ubuntu.
 
@@ -376,7 +465,11 @@ A high-priority stream can delay lower-priority jobs until aging lifts them.
 
 The worker is one process and does not coordinate across hosts.
 
-The project does not provide a web interface.
+The dashboard has no authentication.
+
+Run the dashboard on localhost or on a trusted network.
+
+The dashboard serves one SQLite store.
 
 ## Roadmap
 
@@ -386,12 +479,26 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
-- [ ] Web UI for queue inspection.
+- [x] Web dashboard for queue inspection.
 - [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds a web dashboard for queue inspection.
+
+The new `serve` command serves the dashboard on a local address.
+
+The dashboard shows state counts, job lists, and one job's event timeline.
+
+An operator requeues a dead-lettered job with a corrected payload.
+
+The server also exposes Prometheus metrics at `/metrics`.
+
+A JSON API at `/api` supports scripts and other tools.
+
+The dashboard reads the same SQLite store as every other command.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 

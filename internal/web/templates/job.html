@@ -1,0 +1,59 @@
+{{define "title"}}Job {{shortID .Job.ID}} &middot; Local-first Durable Job Queue{{end}}
+
+{{define "content"}}
+<p class="back"><a href="/">&larr; Back to dashboard</a></p>
+
+<section class="panel">
+  <h2>Job <code class="job-id">{{.Job.ID}}</code></h2>
+  <dl class="job-facts">
+    <div><dt>Kind</dt><dd>{{.Job.Kind}}</dd></div>
+    <div><dt>State</dt><dd><span class="badge state-{{asString .Job.State}}">{{asString .Job.State}}</span></dd></div>
+    <div><dt>Priority</dt><dd>{{.Job.Priority}}</dd></div>
+    <div><dt>Attempts</dt><dd>{{.Job.RetryCount}} / {{.Job.MaxAttempts}}</dd></div>
+    <div><dt>Created</dt><dd>{{formatTime .Job.CreatedAt}}</dd></div>
+    <div><dt>Updated</dt><dd>{{formatTime .Job.UpdatedAt}}</dd></div>
+    {{if .Job.IdempotencyKey}}<div><dt>Idempotency key</dt><dd>{{.Job.IdempotencyKey}}</dd></div>{{end}}
+    {{if .Job.RunAt}}<div><dt>Run at</dt><dd>{{formatTime .Job.RunAt}}</dd></div>{{end}}
+    {{if .Job.LeasedUntil}}<div><dt>Leased until</dt><dd>{{formatTime .Job.LeasedUntil}}</dd></div>{{end}}
+  </dl>
+
+  <h3>Payload</h3>
+  <pre class="payload">{{.Job.Payload}}</pre>
+
+  {{if eq (asString .Job.State) "dead_letter"}}
+  <form class="requeue" method="post" action="/jobs/{{.Job.ID}}/requeue">
+    <h3>Requeue this job</h3>
+    <p class="hint">Edit the payload before the retry, or leave it unchanged.</p>
+    <label for="payload">Payload</label>
+    <textarea name="payload" id="payload" rows="8" spellcheck="false">{{.Job.Payload}}</textarea>
+    <button type="submit">Requeue as pending</button>
+  </form>
+  {{end}}
+</section>
+
+<section class="panel">
+  <h2>Events ({{len .Events}})</h2>
+  {{if eq (len .Events) 0}}
+  <p class="empty">This job has no events.</p>
+  {{else}}
+  <table class="events">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Type</th>
+        <th>Detail</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Events}}
+      <tr>
+        <td>{{formatTime .Timestamp}}</td>
+        <td><span class="badge event-{{asString .EventType}}">{{asString .EventType}}</span></td>
+        <td class="meta">{{if .Metadata}}{{.Metadata}}{{else}}&ndash;{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{end}}
+</section>
+{{end}}

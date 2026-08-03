@@ -1,0 +1,26 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{block "title" .}}Local-first Durable Job Queue{{end}}</title>
+  <link rel="stylesheet" href="/static/site.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/">Job queue</a>
+    <nav class="site-nav">
+      <a href="/">Dashboard</a>
+      <a href="/metrics">Metrics</a>
+      <a href="/api/stats">API</a>
+    </nav>
+  </header>
+  <main class="content">
+    {{template "content" .}}
+  </main>
+  <footer class="site-footer">
+    Durable background jobs backed by SQLite. Requeue is the only write action.
+  </footer>
+</body>
+</html>
+{{end}}

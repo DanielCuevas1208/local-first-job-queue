@@ -23,6 +23,7 @@ Commands:
   requeue  Return a dead-lettered job to the queue
   seed     Load bundled sample data
   metrics  Expose queue state for Prometheus
+  serve    Serve the web dashboard for queue inspection
   demo     Run a self-contained scenario with fault injection
 
 Use <command> -help for command flags.`)
@@ -48,6 +49,8 @@ Use <command> -help for command flags.`)
 		err = cli.Seed(args)
 	case "metrics":
 		err = cli.Metrics(args)
+	case "serve":
+		err = cli.Serve(args)
 	case "demo":
 		err = cli.Demo(args)
 	default:
