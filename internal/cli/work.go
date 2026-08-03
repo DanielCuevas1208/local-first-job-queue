@@ -14,6 +14,7 @@ import (
 	"github.com/local-first-job-queue/internal/fault"
 	"github.com/local-first-job-queue/internal/metrics"
 	"github.com/local-first-job-queue/internal/queue"
+	"github.com/local-first-job-queue/internal/web"
 	"github.com/local-first-job-queue/internal/worker"
 )
 
@@ -37,6 +38,7 @@ func Work(args []string) error {
 	pollInterval := fs.Duration("poll", time.Second, "time between lease attempts")
 	aging := fs.Duration("aging", queue.DefaultAgingInterval, "priority aging interval; a job gains one priority point per interval it waits (0 disables)")
 	metricsAddr := fs.String("metrics-addr", "", "address to serve Prometheus metrics on, e.g. :9090 (empty disables)")
+	webAddr := fs.String("web-addr", "", "address to serve the inspection dashboard on, e.g. :8080 (empty disables)")
 	fs.Parse(args)
 
 	store, err := queue.NewSQLiteStore(*dbPath, queue.WithAgingInterval(*aging))
@@ -53,15 +55,23 @@ func Work(args []string) error {
 		worker.WithPollInterval(*pollInterval),
 	)
 
-	var srv *http.Server
-	if *metricsAddr != "" {
-		srv = &http.Server{Addr: *metricsAddr, Handler: metrics.Handler(store)}
+	var servers []*http.Server
+	serve := func(addr string, h http.Handler, label string) {
+		if addr == "" {
+			return
+		}
+		srv := &http.Server{Addr: addr, Handler: h}
+		servers = append(servers, srv)
 		go func() {
 			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Printf("metrics server: %v", err)
+				log.Printf("%s: %v", label, err)
 			}
 		}()
-		log.Printf("metrics listening on %s", *metricsAddr)
+		log.Printf("%s listening on %s", label, addr)
+	}
+	serve(*metricsAddr, metrics.Handler(store), "metrics")
+	if *webAddr != "" {
+		serve(*webAddr, web.New(store, web.WithDBPath(*dbPath)).Handler(), "dashboard")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -71,10 +81,10 @@ func Work(args []string) error {
 		*kind, *concurrency, *leaseDuration, *pollInterval, *aging)
 	err = w.Run(ctx)
 
-	if srv != nil {
+	for _, srv := range servers {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		cancel()
 	}
 	if errors.Is(err, context.Canceled) {
 		// A signal cancelled the run. This is a normal shutdown, not an error.

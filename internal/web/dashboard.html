@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Queue Dashboard</title>
+<style>
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-edge: #262b36;
+  --text: #d8dee9;
+  --muted: #7f8a9d;
+  --accent: #4c8bf5;
+  --pending: #f5a623;
+  --leased: #4dd0e1;
+  --completed: #3ddc84;
+  --dead: #ff5252;
+  --failed: #ff8a80;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid var(--panel-edge);
+  background: var(--panel);
+}
+h1 { font-size: 1.05rem; margin: 0; letter-spacing: 0.02em; }
+h2 { font-size: 0.9rem; margin: 0; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.meta { display: flex; flex-wrap: wrap; gap: 1.25rem; color: var(--muted); font-size: 0.8rem; }
+.meta code { color: var(--text); }
+label { cursor: pointer; }
+main { padding: 1.25rem; max-width: 1200px; margin: 0 auto; }
+section { margin-bottom: 1.5rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+  border-top: 3px solid var(--muted);
+  border-radius: 4px;
+  padding: 0.75rem 1rem;
+}
+.card .label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.card .value { font-size: 1.6rem; margin-top: 0.25rem; }
+.panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.6rem; }
+.chip {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--panel-edge);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--muted);
+  background: var(--panel);
+  cursor: pointer;
+}
+.chip.active { color: var(--text); border-color: var(--accent); }
+.chip[data-state="pending"] { border-color: var(--pending); }
+.chip[data-state="leased"] { border-color: var(--leased); }
+.chip[data-state="completed"] { border-color: var(--completed); }
+.chip[data-state="dead_letter"] { border-color: var(--dead); }
+.chip[data-state="failed"] { border-color: var(--failed); }
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.45rem;
+  border-radius: 3px;
+  font-size: 0.72rem;
+  color: #0f1115;
+  font-weight: 700;
+}
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--panel-edge); font-size: 0.82rem; vertical-align: top; }
+th { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: #1b202b; }
+.payload { color: var(--muted); max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.time { white-space: nowrap; color: var(--muted); }
+button.link {
+  background: none; border: none; color: var(--accent); cursor: pointer;
+  font: inherit; font-size: 0.8rem; padding: 0;
+}
+button.link:hover { text-decoration: underline; }
+aside#detail {
+  position: fixed; right: 0; top: 0; bottom: 0; width: 480px; max-width: 92vw;
+  background: var(--panel); border-left: 1px solid var(--panel-edge);
+  padding: 1.25rem; overflow-y: auto; z-index: 10;
+}
+aside#detail.hidden { display: none; }
+aside#detail h2 { margin-bottom: 0.75rem; }
+pre {
+  background: #0f1115; border: 1px solid var(--panel-edge); border-radius: 4px;
+  padding: 0.75rem; overflow-x: auto; font-size: 0.78rem; white-space: pre-wrap; word-break: break-all;
+}
+dl { display: grid; grid-template-columns: 150px 1fr; gap: 0.35rem 0.75rem; font-size: 0.8rem; }
+dt { color: var(--muted); }
+dd { margin: 0; word-break: break-all; }
+ul#events { list-style: none; padding: 0; margin: 0; }
+ul#events li { padding: 0.35rem 0; border-bottom: 1px dashed var(--panel-edge); font-size: 0.8rem; }
+ul#events .ev { color: var(--muted); }
+footer { color: var(--muted); font-size: 0.75rem; padding: 1rem 1.25rem; border-top: 1px solid var(--panel-edge); }
+.hidden-row { display: none; }
+.muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Local-first Durable Job Queue</h1>
+  <div class="meta">
+    <span>db: <code id="db-path">{{.DBPath}}</code></span>
+    <span>updated <span id="updated">-</span></span>
+    <label><input type="checkbox" id="auto-refresh" checked> auto refresh</label>
+    <span><a class="link" href="/api/snapshot" target="_blank" rel="noopener">json</a></span>
+  </div>
+</header>
+
+<main>
+  <section aria-label="Queue state by status">
+    <div id="stats" class="cards"></div>
+  </section>
+
+  <section aria-label="Jobs by kind and status">
+    <div class="panel-head"><h2>Jobs by kind</h2></div>
+    <table>
+      <thead><tr><th>Kind</th><th>Pending</th><th>Leased</th><th>Completed</th><th>Dead letter</th><th>Failed</th><th>Total</th></tr></thead>
+      <tbody id="kinds"></tbody>
+    </table>
+  </section>
+
+  <section aria-label="Job list">
+    <div class="panel-head">
+      <h2>Jobs</h2>
+      <div id="filters"></div>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Status</th><th>Kind</th><th>Pri</th><th>Attempts</th><th>Created</th><th>Payload</th><th></th></tr>
+      </thead>
+      <tbody id="jobs"></tbody>
+    </table>
+    <p id="jobs-empty" class="muted hidden-row">No jobs match the current filter.</p>
+  </section>
+
+  <section aria-label="Recent events">
+    <div class="panel-head"><h2>Recent events</h2></div>
+    <ul id="events"></ul>
+  </section>
+</main>
+
+<footer>
+  Inspect with: jobqueue inspect -db &lt;path&gt; | View one job with: jobqueue history &lt;id&gt; -db &lt;path&gt; | Requeue a dead letter with: jobqueue requeue &lt;id&gt; -db &lt;path&gt;
+</footer>
+
+<aside id="detail" class="hidden">
+  <div class="panel-head">
+    <h2 id="detail-id">Job detail</h2>
+    <button class="link" id="detail-close" type="button">close</button>
+  </div>
+  <dl id="detail-fields"></dl>
+  <h2>Payload</h2>
+  <pre id="detail-payload"></pre>
+  <h2>Timeline</h2>
+  <table>
+    <thead><tr><th>Time</th><th>Event</th><th>Detail</th></tr></thead>
+    <tbody id="detail-events"></tbody>
+  </table>
+  <p class="muted hidden-row" id="detail-action"></p>
+</aside>
+
+<script>
+"use strict";
+
+var STATES = [
+  { id: "pending",     label: "pending",     color: "var(--pending)" },
+  { id: "leased",      label: "leased",      color: "var(--leased)" },
+  { id: "completed",   label: "completed",   color: "var(--completed)" },
+  { id: "dead_letter", label: "dead letter", color: "var(--dead)" },
+  { id: "failed",      label: "failed",      color: "var(--failed)" }
+];
+
+var dbPath = document.getElementById("db-path").textContent;
+var jobsData = [];
+var lastStats = {};
+var currentFilter = "all";
+var currentJobId = null;
+var timer = null;
+
+function esc(v) {
+  return String(v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function shortId(id) {
+  return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+function stateColor(state) {
+  for (var i = 0; i < STATES.length; i++) {
+    if (STATES[i].id === state) return STATES[i].color;
+  }
+  return "var(--muted)";
+}
+
+function fmtTime(iso) {
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleTimeString([], { hour12: false });
+}
+
+function stateBadge(state) {
+  return '<span class="badge" style="background:' + stateColor(state) + '">' + esc(state) + "</span>";
+}
+
+function load() {
+  fetch("/api/snapshot")
+    .then(function (res) {
+      if (!res.ok) throw new Error("snapshot " + res.status);
+      return res.json();
+    })
+    .then(render)
+    .catch(function (err) {
+      document.getElementById("updated").textContent = "error: " + err.message;
+    });
+}
+
+function render(snap) {
+  document.getElementById("updated").textContent = fmtTime(new Date().toISOString());
+  jobsData = snap.jobs || [];
+  lastStats = snap.stats || {};
+  renderStats(lastStats);
+  renderKinds(jobsData);
+  renderFilters();
+  renderJobs();
+  renderEvents(snap.events || []);
+}
+
+function renderStats(stats) {
+  var cards = [];
+  for (var i = 0; i < STATES.length; i++) {
+    var s = STATES[i];
+    var n = stats[s.id] || 0;
+    cards.push(
+      '<div class="card" style="border-top-color:' + s.color + '">' +
+        '<div class="label">' + s.label + "</div>" +
+        '<div class="value">' + n + "</div></div>"
+    );
+  }
+  document.getElementById("stats").innerHTML = cards.join("");
+}
+
+function renderKinds(jobs) {
+  var byKind = {};
+  for (var i = 0; i < jobs.length; i++) {
+    var j = jobs[i];
+    byKind[j.kind] = byKind[j.kind] || { pending: 0, leased: 0, completed: 0, dead_letter: 0, failed: 0, total: 0 };
+    byKind[j.kind][j.state] = (byKind[j.kind][j.state] || 0) + 1;
+    byKind[j.kind].total += 1;
+  }
+  var kinds = Object.keys(byKind).sort();
+  var rows = [];
+  for (var k = 0; k < kinds.length; k++) {
+    var name = kinds[k];
+    var c = byKind[name];
+    rows.push(
+      "<tr><td>" + esc(name) + "</td>" +
+        "<td>" + c.pending + "</td><td>" + c.leased + "</td><td>" + c.completed + "</td>" +
+        "<td>" + c.dead_letter + "</td><td>" + c.failed + "</td><td>" + c.total + "</td></tr>"
+    );
+  }
+  document.getElementById("kinds").innerHTML = rows.join("");
+}
+
+function renderFilters() {
+  var total = jobsData.length;
+  var out = '<span class="chip' + (currentFilter === "all" ? " active" : "") + '" data-state="all">all ' + total + "</span>";
+  for (var i = 0; i < STATES.length; i++) {
+    var s = STATES[i];
+    var n = lastStats[s.id] || 0;
+    if (n === 0 && currentFilter !== s.id) continue;
+    out += '<span class="chip' + (currentFilter === s.id ? " active" : "") + '" data-state="' + s.id + '">' + s.label + " " + n + "</span>";
+  }
+  document.getElementById("filters").innerHTML = out;
+}
+
+function renderJobs() {
+  var filtered = jobsData.filter(function (j) {
+    return currentFilter === "all" || j.state === currentFilter;
+  });
+  var rows = [];
+  for (var i = 0; i < filtered.length; i++) {
+    var j = filtered[i];
+    rows.push(
+      '<tr data-id="' + esc(j.id) + '">' +
+        "<td>" + stateBadge(j.state) + "</td>" +
+        "<td>" + esc(j.kind) + "</td>" +
+        "<td>" + j.priority + "</td>" +
+        "<td>" + j.retry_count + "/" + j.max_attempts + "</td>" +
+        '<td class="time">' + fmtTime(j.created_at) + "</td>" +
+        '<td class="payload">' + esc(j.payload) + "</td>" +
+        "<td>" + (j.state === "dead_letter" ? '<button class="link" data-requeue="' + esc(j.id) + '" type="button">requeue</button>' : "") + "</td>" +
+        "</tr>"
+    );
+  }
+  document.getElementById("jobs").innerHTML = rows.join("");
+  document.getElementById("jobs-empty").className = filtered.length === 0 ? "muted" : "muted hidden-row";
+}
+
+function renderEvents(events) {
+  var items = [];
+  var limit = Math.min(events.length, 60);
+  for (var i = 0; i < limit; i++) {
+    var e = events[i];
+    var meta = e.metadata || "";
+    items.push(
+      "<li><span class=\"time\">" + fmtTime(e.timestamp) + "</span> " +
+        "<a class=\"link\" href=\"#\" data-job=\"" + esc(e.job_id) + "\">" + esc(shortId(e.job_id)) + "</a> " +
+        stateBadge(e.event_type) + " <span class=\"ev\">" + esc(meta) + "</span></li>"
+    );
+  }
+  document.getElementById("events").innerHTML = items.join("");
+}
+
+function viewJob(id) {
+  fetch("/api/jobs/" + encodeURIComponent(id))
+    .then(function (res) {
+      if (!res.ok) throw new Error("job " + res.status);
+      return res.json();
+    })
+    .then(function (d) {
+      currentJobId = d.job.id;
+      document.getElementById("detail-id").textContent = "Job " + shortId(d.job.id);
+      document.getElementById("detail-payload").textContent = d.job.payload;
+      renderDetailFields(d.job);
+      renderDetailEvents(d.events || []);
+      var action = document.getElementById("detail-action");
+      if (d.job.state === "dead_letter") {
+        action.innerHTML = '<button class="link" id="detail-requeue" type="button">requeue this job</button>';
+      } else {
+        action.innerHTML = "";
+      }
+      document.getElementById("detail").classList.remove("hidden");
+    })
+    .catch(function (err) {
+      document.getElementById("updated").textContent = "error: " + err.message;
+    });
+}
+
+function renderDetailFields(job) {
+  var fields = [
+    ["id", job.id],
+    ["kind", job.kind],
+    ["status", job.state],
+    ["priority", job.priority],
+    ["attempts", job.retry_count + "/" + job.max_attempts],
+    ["idempotency key", job.idempotency_key || "-"],
+    ["created", job.created_at],
+    ["updated", job.updated_at],
+    ["leased until", job.leased_until || "-"],
+    ["run at", job.run_at || "-"]
+  ];
+  var html = "";
+  for (var i = 0; i < fields.length; i++) {
+    html += "<dt>" + esc(fields[i][0]) + "</dt><dd>" + esc(fields[i][1]) + "</dd>";
+  }
+  document.getElementById("detail-fields").innerHTML = html;
+}
+
+function renderDetailEvents(events) {
+  var rows = [];
+  for (var i = 0; i < events.length; i++) {
+    var e = events[i];
+    rows.push(
+      "<tr><td class=\"time\">" + fmtTime(e.timestamp) + "</td>" +
+        "<td>" + stateBadge(e.event_type) + "</td><td>" + esc(e.metadata || "") + "</td></tr>"
+    );
+  }
+  document.getElementById("detail-events").innerHTML = rows.join("");
+}
+
+function requeue(id) {
+  fetch("/api/jobs/" + encodeURIComponent(id) + "/requeue", { method: "POST" })
+    .then(function (res) {
+      if (!res.ok) return res.text().then(function (t) { throw new Error(t.trim()); });
+      return res.json();
+    })
+    .then(function () {
+      document.getElementById("detail").classList.add("hidden");
+      load();
+    })
+    .catch(function (err) {
+      document.getElementById("updated").textContent = "requeue failed: " + err.message;
+    });
+}
+
+document.getElementById("jobs").addEventListener("click", function (ev) {
+  var requeueBtn = ev.target.closest("[data-requeue]");
+  if (requeueBtn) {
+    ev.stopPropagation();
+    requeue(requeueBtn.getAttribute("data-requeue"));
+    return;
+  }
+  var row = ev.target.closest("tr[data-id]");
+  if (row) viewJob(row.getAttribute("data-id"));
+});
+
+document.getElementById("events").addEventListener("click", function (ev) {
+  ev.preventDefault();
+  var link = ev.target.closest("[data-job]");
+  if (link) viewJob(link.getAttribute("data-job"));
+});
+
+document.getElementById("filters").addEventListener("click", function (ev) {
+  var chip = ev.target.closest("[data-state]");
+  if (!chip) return;
+  currentFilter = chip.getAttribute("data-state");
+  renderFilters();
+  renderJobs();
+});
+
+document.getElementById("detail-close").addEventListener("click", function () {
+  document.getElementById("detail").classList.add("hidden");
+});
+
+document.addEventListener("click", function (ev) {
+  if (ev.target && ev.target.id === "detail-requeue" && currentJobId) {
+    requeue(currentJobId);
+  }
+});
+
+document.getElementById("auto-refresh").addEventListener("change", function (ev) {
+  if (ev.target.checked) startTimer();
+  else stopTimer();
+});
+
+function startTimer() {
+  stopTimer();
+  timer = setInterval(load, 3000);
+}
+
+function stopTimer() {
+  if (timer) clearInterval(timer);
+  timer = null;
+}
+
+load();
+startTimer();
+</script>
+</body>
+</html>

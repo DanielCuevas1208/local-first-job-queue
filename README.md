@@ -2,7 +2,7 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, an append-only event log, and an HTML inspection dashboard.
 
 ## Value
 
@@ -21,6 +21,7 @@ The queue separates durable state from worker execution.
 - `internal/fault` injects deterministic errors, panics, delays, and stalls.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
+- `internal/web` serves the HTML inspection dashboard and its JSON API.
 - `internal/fixture` provides repeatable sample workloads.
 
 A job starts as `pending`.
@@ -67,6 +68,14 @@ go run . seed -db queue.db
 go run . inspect -db queue.db
 ```
 
+Serve the inspection dashboard with this command.
+
+```text
+go run . web -addr :8080 -db queue.db
+```
+
+Open http://localhost:8080 in a browser.
+
 Inspect and requeue a dead-lettered job with these commands.
 
 ```text
@@ -89,7 +98,7 @@ jobqueue enqueue -kind <type> -payload <json> [-priority <n>] [-idempotency-key 
 ### `work`
 
 ```text
-jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-metrics-addr <addr>] [-db <path>]
+jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-metrics-addr <addr>] [-web-addr <addr>] [-db <path>]
 ```
 
 The worker recovers expired leases when it starts.
@@ -101,6 +110,8 @@ A job gains one priority point per interval it waits.
 Use `-aging 0` to disable aging.
 
 Use `-metrics-addr` to serve Prometheus metrics beside the worker.
+
+Use `-web-addr` to serve the inspection dashboard beside the worker.
 
 ### `inspect`
 
@@ -153,6 +164,30 @@ The default address is `:9090`.
 Scrape the endpoint with a Prometheus server.
 
 Use `-once` to print one snapshot and exit.
+
+### `web`
+
+```text
+jobqueue web [-addr <addr>] [-db <path>]
+```
+
+The command serves the HTML inspection dashboard.
+
+The default address is `:8080`.
+
+The dashboard shows state counts, jobs by kind, and a filterable job table.
+
+Click any job to see its payload and complete event timeline.
+
+The page refreshes itself every few seconds.
+
+The JSON API lives under `/api/`.
+
+Use `/api/snapshot` to fetch the full queue state.
+
+Use `/api/jobs/<id>` to fetch one job and its events.
+
+Use `POST /api/jobs/<id>/requeue` to return a dead-lettered job to pending.
 
 ### `demo`
 
@@ -260,6 +295,22 @@ Use the `metrics` command for one snapshot or a live endpoint.
 
 Use `work -metrics-addr` to serve the same endpoint beside a worker.
 
+### Web dashboard
+
+The `web` command serves an HTML page and a JSON API.
+
+The page renders in the browser and needs no build step.
+
+State counts, job tables, and the event feed update on a timer.
+
+Click any job to inspect its payload and full timeline.
+
+The dashboard reads the same SQLite store as the worker.
+
+The JSON API is available to scripts without the HTML page.
+
+Use `work -web-addr` to serve the dashboard beside a worker.
+
 ### Scheduling
 
 A scheduled job stores its earliest lease time in `run_at`.
@@ -339,6 +390,32 @@ The demo uses generated job IDs and current timestamps.
 
 The final counts depend on the scenario and run deadline.
 
+### Dashboard
+
+Run `jobqueue web -db queue.db` and open the root path.
+
+The page shows the whole queue in one view.
+
+```text
+Local-first Durable Job Queue      db: queue.db   updated 18:13:10
+
+  pending 3 | leased 0 | completed 6 | dead letter 1 | failed 0
+
+Jobs by kind
+  kind      pending  leased  completed  dead letter  failed  total
+  email           0       0          3            0       0      3
+  report          2       0          0            1       0      3
+
+Jobs
+  status       kind      pri  attempts  created              payload
+  dead_letter  report      0   3/3      2026-08-03 18:13:05  {"task":"report"}
+  pending      report      2   0/3      2026-08-03 18:13:05  {"task":"report"}
+```
+
+The page polls the JSON API every three seconds.
+
+Click a job to open its detail panel and full timeline.
+
 ## Verification
 
 Run the full test suite with this command.
@@ -376,7 +453,7 @@ A high-priority stream can delay lower-priority jobs until aging lifts them.
 
 The worker is one process and does not coordinate across hosts.
 
-The project does not provide a web interface.
+The dashboard is read-only except for the requeue action.
 
 ## Roadmap
 
@@ -386,12 +463,24 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
-- [ ] Web UI for queue inspection.
+- [x] Web UI for queue inspection.
 - [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds a web dashboard for queue inspection.
+
+The new `web` command serves an HTML page and a JSON API.
+
+The page shows state counts, jobs by kind, and a filterable job table.
+
+Click a job to see its payload and complete event timeline.
+
+The page refreshes itself every few seconds while a worker runs.
+
+Use `work -web-addr` to serve the dashboard beside a worker.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 
