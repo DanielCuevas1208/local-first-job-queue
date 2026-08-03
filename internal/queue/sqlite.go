@@ -10,11 +10,40 @@ import (
 
 const sqliteTimeFormat = time.RFC3339Nano
 
-type SQLiteStore struct {
-	db *sql.DB
+// DefaultAgingInterval is the recommended priority aging interval. A job gains
+// one priority point per interval it has waited, which prevents a constant
+// high-priority stream from starving lower-priority work. The work command
+// uses this value unless the operator overrides it.
+const DefaultAgingInterval = 30 * time.Second
+
+type StoreOption func(*storeConfig)
+
+type storeConfig struct {
+	agingInterval time.Duration
+	agingSet      bool
 }
 
-func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
+// WithAgingInterval sets the priority aging interval. A pending job gains one
+// priority point per interval it has waited, so a lower-priority job eventually
+// overtakes a constant stream of higher-priority work. A zero interval keeps
+// the plain priority ordering. When the option is absent, aging is disabled.
+func WithAgingInterval(d time.Duration) StoreOption {
+	return func(c *storeConfig) {
+		c.agingInterval = d
+		c.agingSet = true
+	}
+}
+
+type SQLiteStore struct {
+	db            *sql.DB
+	agingInterval time.Duration
+}
+
+func NewSQLiteStore(dbPath string, opts ...StoreOption) (*SQLiteStore, error) {
+	cfg := storeConfig{}
+	for _, o := range opts {
+		o(&cfg)
+	}
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -24,7 +53,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	if err := migrate(db); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &SQLiteStore{db: db}, nil
+	return &SQLiteStore{db: db, agingInterval: cfg.agingInterval}, nil
 }
 
 func migrate(db *sql.DB) error {
@@ -188,11 +217,12 @@ func (s *SQLiteStore) LeaseJob(kind string, leaseDuration time.Duration) (*Job, 
 	}
 	defer tx.Rollback()
 
-	row := tx.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+	orderBy, orderArgs := s.pendingOrderBy(now)
+	query := `SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
 		 FROM jobs WHERE kind = ? AND state = 'pending'
-		   AND (run_at IS NULL OR run_at <= ?)
-		 ORDER BY priority DESC, COALESCE(run_at, created_at) ASC, created_at ASC, id ASC LIMIT 1`, kind, now.Format(sqliteTimeFormat))
+		   AND (run_at IS NULL OR run_at <= ?) ORDER BY ` + orderBy + ` LIMIT 1`
+	args := append([]any{kind, now.Format(sqliteTimeFormat)}, orderArgs...)
+	row := tx.QueryRow(query, args...)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -289,18 +319,54 @@ func (s *SQLiteStore) FailJob(id string, retry bool) error {
 		return nil
 	}
 	_, err := s.db.Exec(
-		`UPDATE jobs SET state = 'failed', leased_until = NULL, updated_at = ?
+		`UPDATE jobs SET state = 'dead_letter', retry_count = retry_count + 1, leased_until = NULL, updated_at = ?
 		 WHERE id = ? AND state = 'leased'`,
 		now.Format(sqliteTimeFormat), id)
 	if err != nil {
-		return fmt.Errorf("fail job: %w", err)
+		return fmt.Errorf("dead-letter job: %w", err)
 	}
 	return nil
 }
 
+// RequeueJob returns a dead-lettered job to the pending state with a fresh
+// attempt budget. The caller may supply a new payload and a new attempt limit.
+// When the job is not dead-lettered, the update matches no row and an error is
+// returned.
+func (s *SQLiteStore) RequeueJob(id string, maxAttempts int, payload *string) (Job, error) {
+	now := time.Now().UTC()
+	var (
+		res sql.Result
+		err error
+	)
+	if payload != nil {
+		res, err = s.db.Exec(
+			`UPDATE jobs SET state = 'pending', retry_count = 0, max_attempts = ?,
+			   payload = ?, leased_until = NULL, updated_at = ?
+			 WHERE id = ? AND state = 'dead_letter'`,
+			maxAttempts, *payload, now.Format(sqliteTimeFormat), id)
+	} else {
+		res, err = s.db.Exec(
+			`UPDATE jobs SET state = 'pending', retry_count = 0, max_attempts = ?,
+			   leased_until = NULL, updated_at = ?
+			 WHERE id = ? AND state = 'dead_letter'`,
+			maxAttempts, now.Format(sqliteTimeFormat), id)
+	}
+	if err != nil {
+		return Job{}, fmt.Errorf("requeue job: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return Job{}, fmt.Errorf("rows affected: %w", err)
+	}
+	if n == 0 {
+		return Job{}, fmt.Errorf("job %s is not dead-lettered", id)
+	}
+	return s.GetJob(id)
+}
+
 // RecoverOrphanedLeases finds jobs whose lease deadline passed and returns
 // them to the pending state. Each recovery consumes one attempt. When no
-// attempt remains, the job enters the failed state instead of looping.
+// attempt remains, the job enters the dead-letter state instead of looping.
 // The returned slice reports the jobs that were touched, with their updated
 // retry counters, so callers can log a recovery event per job.
 func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
@@ -326,18 +392,19 @@ func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 		return nil, nil
 	}
 
-	for _, j := range orphans {
+	for i := range orphans {
+		j := &orphans[i]
 		nextAttempt := j.RetryCount + 1
 		if nextAttempt >= j.MaxAttempts {
 			_, err := s.db.Exec(
-				`UPDATE jobs SET state = 'failed', leased_until = NULL, updated_at = ?
+				`UPDATE jobs SET state = 'dead_letter', retry_count = ?, leased_until = NULL, updated_at = ?
 				 WHERE id = ? AND state = 'leased'`,
-				now.Format(sqliteTimeFormat), j.ID)
+				nextAttempt, now.Format(sqliteTimeFormat), j.ID)
 			if err != nil {
-				return nil, fmt.Errorf("fail orphaned job %s: %w", j.ID, err)
+				return nil, fmt.Errorf("dead-letter orphaned job %s: %w", j.ID, err)
 			}
 			j.RetryCount = nextAttempt
-			j.State = StateFailed
+			j.State = StateDeadLetter
 			continue
 		}
 		_, err := s.db.Exec(
@@ -353,8 +420,28 @@ func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 	return orphans, nil
 }
 
+// pendingOrderBy builds the ORDER BY clause for ready jobs. When aging is
+// enabled, a job gains one priority point for each aging interval it has
+// waited since it became ready. The boost is added to the stored priority, so
+// an older low-priority job can overtake a fresher high-priority job. The
+// returned arguments bind the "now" timestamp and the aging interval, and are
+// appended to the caller's query arguments. Aging is measured from the earlier
+// of run_at and created_at, so a scheduled job only ages once it is ready.
+func (s *SQLiteStore) pendingOrderBy(now time.Time) (string, []any) {
+	if s.agingInterval <= 0 {
+		return `priority DESC, COALESCE(run_at, created_at) ASC, created_at ASC, id ASC`, nil
+	}
+	agingSec := s.agingInterval.Seconds()
+	orderBy := `(priority + CAST((julianday(?) - julianday(COALESCE(run_at, created_at))) * 86400.0 / ? AS INTEGER)) DESC,
+		priority DESC, COALESCE(run_at, created_at) ASC, created_at ASC, id ASC`
+	args := []any{now.Format(sqliteTimeFormat), agingSec}
+	return orderBy, args
+}
+
 func (s *SQLiteStore) GetPendingJobs() ([]Job, error) {
-	return s.queryJobs(`WHERE state = 'pending' ORDER BY priority DESC, COALESCE(run_at, created_at) ASC, created_at ASC, id ASC`)
+	orderBy, orderArgs := s.pendingOrderBy(time.Now().UTC())
+	where := "WHERE state = 'pending' ORDER BY " + orderBy
+	return s.queryJobs(where, orderArgs...)
 }
 
 func (s *SQLiteStore) GetLeasedJobs() ([]Job, error) {
@@ -365,10 +452,10 @@ func (s *SQLiteStore) GetAllJobs() ([]Job, error) {
 	return s.queryJobs(`ORDER BY created_at DESC`)
 }
 
-func (s *SQLiteStore) queryJobs(where string) ([]Job, error) {
+func (s *SQLiteStore) queryJobs(where string, args ...any) ([]Job, error) {
 	rows, err := s.db.Query(
 		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
-		 FROM jobs ` + where)
+		 FROM jobs `+where, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query jobs: %w", err)
 	}
@@ -402,6 +489,71 @@ func (s *SQLiteStore) GetQueueStats() (map[JobState]int, error) {
 		stats[JobState(state)] = count
 	}
 	return stats, nil
+}
+
+// GetStateKindCounts returns the number of jobs for each (kind, state) pair.
+// The result is stable, so exporters can render it in a fixed order.
+func (s *SQLiteStore) GetStateKindCounts() ([]KindStateCount, error) {
+	rows, err := s.db.Query(`SELECT kind, state, COUNT(*) FROM jobs GROUP BY kind, state ORDER BY kind, state`)
+	if err != nil {
+		return nil, fmt.Errorf("query kind counts: %w", err)
+	}
+	defer rows.Close()
+
+	var counts []KindStateCount
+	for rows.Next() {
+		var c KindStateCount
+		var state string
+		if err := rows.Scan(&c.Kind, &state, &c.Count); err != nil {
+			return nil, fmt.Errorf("scan kind count: %w", err)
+		}
+		c.State = JobState(state)
+		counts = append(counts, c)
+	}
+	return counts, nil
+}
+
+// GetEventTypeCounts returns the number of events for each event type. The
+// event log is append-only, so each count grows and never shrinks.
+func (s *SQLiteStore) GetEventTypeCounts() ([]EventTypeCount, error) {
+	rows, err := s.db.Query(`SELECT event_type, COUNT(*) FROM events GROUP BY event_type ORDER BY event_type`)
+	if err != nil {
+		return nil, fmt.Errorf("query event counts: %w", err)
+	}
+	defer rows.Close()
+
+	var counts []EventTypeCount
+	for rows.Next() {
+		var c EventTypeCount
+		var et string
+		if err := rows.Scan(&et, &c.Count); err != nil {
+			return nil, fmt.Errorf("scan event count: %w", err)
+		}
+		c.EventType = EventType(et)
+		counts = append(counts, c)
+	}
+	return counts, nil
+}
+
+// GetOldestPendingReadyTime returns the ready time of the oldest pending job.
+// The ready time is the earlier of run_at and created_at, matching the lease
+// ordering. ok is false when no job is pending.
+func (s *SQLiteStore) GetOldestPendingReadyTime() (ready time.Time, ok bool, err error) {
+	var raw string
+	err = s.db.QueryRow(
+		`SELECT COALESCE(run_at, created_at) FROM jobs
+		 WHERE state = 'pending' ORDER BY COALESCE(run_at, created_at) ASC LIMIT 1`).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("query oldest pending: %w", err)
+	}
+	t, err := time.Parse(sqliteTimeFormat, raw)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse oldest pending: %w", err)
+	}
+	return t, true, nil
 }
 
 func (s *SQLiteStore) AppendEvent(e Event) error {

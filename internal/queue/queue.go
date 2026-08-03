@@ -11,7 +11,7 @@ import (
 
 // DefaultMaxAttempts is the maximum number of attempts allowed for a job,
 // including the first attempt. A job with this value runs once and may retry
-// twice more before it enters the failed state.
+// twice more before it enters the dead-letter state.
 const DefaultMaxAttempts = 3
 
 // DefaultPriority is used when an enqueue call does not set a priority.
@@ -72,6 +72,30 @@ func WithRunAfter(d time.Duration) EnqueueOption {
 		}
 		v := time.Now().UTC().Add(d)
 		c.runAt = &v
+	}
+}
+
+type RequeueOption func(*requeueConfig)
+
+type requeueConfig struct {
+	maxAttempts int
+	payload     *string
+}
+
+// RequeueWithMaxAttempts sets a new attempt budget for a requeued job. The
+// default keeps the budget the job had when it was dead-lettered.
+func RequeueWithMaxAttempts(n int) RequeueOption {
+	return func(c *requeueConfig) {
+		c.maxAttempts = n
+	}
+}
+
+// RequeueWithPayload replaces the payload of a requeued job. The default keeps
+// the original payload, so an operator can fix the job data before retrying.
+func RequeueWithPayload(payload string) RequeueOption {
+	return func(c *requeueConfig) {
+		v := payload
+		c.payload = &v
 	}
 }
 
@@ -212,8 +236,8 @@ func (q *Queue) Fail(jobID string, errMsg string) error {
 		return fmt.Errorf("fail job: %w", err)
 	}
 
-	evType := EventFailed
-	meta := errMsg
+	evType := EventDeadLettered
+	meta := fmt.Sprintf("attempt %d/%d exhausted: %s", job.RetryCount+1, job.MaxAttempts, errMsg)
 	if shouldRetry {
 		evType = EventRetried
 		meta = fmt.Sprintf("attempt %d/%d: %s", job.RetryCount+1, job.MaxAttempts, errMsg)
@@ -232,7 +256,9 @@ func (q *Queue) Fail(jobID string, errMsg string) error {
 
 // Recover returns orphaned leases to the pending state. A lease is orphaned
 // when its deadline passed and no worker acknowledged it. Recovered jobs get
-// one extra attempt. When no attempt remains, the job enters the failed state.
+// one extra attempt. When no attempt remains, the job enters the dead-letter
+// state. Each recovered job logs one event: recovered, or dead_lettered when
+// the attempt budget is gone.
 func (q *Queue) Recover() (int, error) {
 	recovered, err := q.store.RecoverOrphanedLeases()
 	if err != nil {
@@ -246,12 +272,55 @@ func (q *Queue) Recover() (int, error) {
 			Timestamp: now,
 		}
 		meta := fmt.Sprintf("attempt %d/%d", r.RetryCount, r.MaxAttempts)
+		if r.State == StateDeadLetter {
+			ev.EventType = EventDeadLettered
+			meta = fmt.Sprintf("attempt %d/%d exhausted", r.RetryCount, r.MaxAttempts)
+		}
 		ev.Metadata = &meta
 		if err := q.store.AppendEvent(ev); err != nil {
 			return len(recovered), fmt.Errorf("log recovery event: %w", err)
 		}
 	}
 	return len(recovered), nil
+}
+
+// Requeue returns a dead-lettered job to the pending state with a fresh
+// attempt budget. The original job data is kept unless an option overrides it.
+// A requeued job can fail again and re-enter the dead-letter queue.
+func (q *Queue) Requeue(jobID string, opts ...RequeueOption) (*Job, error) {
+	cfg := requeueConfig{}
+	for _, o := range opts {
+		o(&cfg)
+	}
+
+	job, err := q.store.GetJob(jobID)
+	if err != nil {
+		return nil, fmt.Errorf("get job: %w", err)
+	}
+	if job.State != StateDeadLetter {
+		return nil, fmt.Errorf("job %s is %s, not dead-lettered", jobID, job.State)
+	}
+	maxAttempts := job.MaxAttempts
+	if cfg.maxAttempts >= 1 {
+		maxAttempts = cfg.maxAttempts
+	}
+
+	updated, err := q.store.RequeueJob(jobID, maxAttempts, cfg.payload)
+	if err != nil {
+		return nil, err
+	}
+
+	meta := fmt.Sprintf("attempts reset to 0/%d", maxAttempts)
+	ev := Event{
+		JobID:     jobID,
+		EventType: EventRequeued,
+		Timestamp: time.Now().UTC(),
+		Metadata:  &meta,
+	}
+	if err := q.store.AppendEvent(ev); err != nil {
+		return nil, fmt.Errorf("log event: %w", err)
+	}
+	return &updated, nil
 }
 
 func (q *Queue) Inspect() (*QueueSnapshot, error) {

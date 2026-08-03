@@ -20,7 +20,9 @@ Commands:
   work     Start a worker process
   inspect  View queue state and event log
   history  View the event log for one job
+  requeue  Return a dead-lettered job to the queue
   seed     Load bundled sample data
+  metrics  Expose queue state for Prometheus
   demo     Run a self-contained scenario with fault injection
 
 Use <command> -help for command flags.`)
@@ -40,8 +42,12 @@ Use <command> -help for command flags.`)
 		err = cli.Inspect(args)
 	case "history":
 		err = cli.History(args)
+	case "requeue":
+		err = cli.Requeue(args)
 	case "seed":
 		err = cli.Seed(args)
+	case "metrics":
+		err = cli.Metrics(args)
 	case "demo":
 		err = cli.Demo(args)
 	default:
