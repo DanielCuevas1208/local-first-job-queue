@@ -1,26 +1,29 @@
 # Local-first Durable Job Queue
 
-A small durable background queue built with Go and SQLite.
+A small durable background job queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+It demonstrates leases, retries, idempotency keys, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an inspectable append-only event log.
 
 ## Value
 
 Use this project to study queue behavior without an external service.
 
-Every lease, retry, recovery, and acknowledgement remains visible in SQLite.
+Every lease, retry, recovery, and acknowledgement stays visible in SQLite.
 
 The demo injects repeatable faults, so failure paths are easy to inspect.
+
+The web dashboard shows live queue state in a browser.
 
 ## Architecture
 
 The queue separates durable state from worker execution.
 
-- `internal/queue` owns the public queue API and SQLite store.
+- `internal/queue` owns the queue API and the SQLite store.
 - `internal/worker` leases jobs and runs handlers.
 - `internal/fault` injects deterministic errors, panics, delays, and stalls.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
+- `internal/web` serves a browser dashboard and a JSON API.
 - `internal/fixture` provides repeatable sample workloads.
 
 A job starts as `pending`.
@@ -31,7 +34,7 @@ The worker acknowledges success or records failure.
 
 An expired lease returns to the queue during recovery.
 
-Each transition appends an event with a timestamp and optional metadata.
+Each transition appends one event with a timestamp and optional metadata.
 
 ## Setup
 
@@ -60,12 +63,24 @@ Run the deterministic showcase with this command.
 go run . demo
 ```
 
-Load sample jobs with this command.
+Load sample jobs with these commands.
 
 ```text
 go run . seed -db queue.db
 go run . inspect -db queue.db
 ```
+
+Serve the browser dashboard with this command.
+
+```text
+go run . web -db queue.db -addr :8080
+```
+
+Open `http://localhost:8080/` in a browser.
+
+The dashboard shows state counts, jobs, recent events, and per-job timelines.
+
+The same port serves Prometheus metrics at `/metrics`.
 
 Inspect and requeue a dead-lettered job with these commands.
 
@@ -100,8 +115,6 @@ A job gains one priority point per interval it waits.
 
 Use `-aging 0` to disable aging.
 
-Use `-metrics-addr` to serve Prometheus metrics beside the worker.
-
 ### `inspect`
 
 ```text
@@ -109,8 +122,6 @@ jobqueue inspect [-json] [-db <path>]
 ```
 
 The command prints state counts, recent events, and job details.
-
-The JSON form supports scripts and other inspection tools.
 
 ### `history`
 
@@ -127,10 +138,6 @@ jobqueue requeue <job-id> [-db <path>] [-max-attempts <n>] [-payload <json>]
 ```
 
 The command returns a dead-lettered job to the pending state.
-
-The job resets its attempt count and keeps its data.
-
-Use `-payload` to correct the job data before it runs again.
 
 ### `seed`
 
@@ -150,9 +157,25 @@ The command serves queue state in the Prometheus text format.
 
 The default address is `:9090`.
 
-Scrape the endpoint with a Prometheus server.
-
 Use `-once` to print one snapshot and exit.
+
+### `web`
+
+```text
+jobqueue web [-addr <addr>] [-db <path>]
+```
+
+The command serves a browser dashboard for queue inspection.
+
+It serves the dashboard, a JSON API, and the Prometheus endpoint on one port.
+
+The default address is `:8080`.
+
+The page refreshes every three seconds.
+
+Click a job row to open its event timeline.
+
+The API routes are `/api/snapshot` and `/api/jobs/<id>`.
 
 ### `demo`
 
@@ -174,9 +197,9 @@ An expired lease becomes recoverable.
 
 Ready jobs with higher priority values lease first.
 
-A future job cannot bypass its `run_at` time, even when its priority is higher.
+A future job cannot bypass its `run_at` time.
 
-Equal priorities use readiness time, creation time, and job ID as deterministic tie breakers.
+Equal priorities use readiness time, creation time, and job ID as tie breakers.
 
 ### Priority aging
 
@@ -184,25 +207,13 @@ A pending job gains one priority point per aging interval it waits.
 
 The interval is a store setting; the default is 30 seconds.
 
-The `work` command enables aging by default.
-
-Use `-aging 0` to disable it.
-
-An older low-priority job can overtake a fresher high-priority job.
-
-The store measures the wait from the job's readiness time.
-
-A scheduled job starts aging only when its `run_at` time passes.
-
 Aging prevents a constant high-priority stream from starving other work.
-
-The `demo` command shows a low-priority job winning after five intervals.
 
 ### Retries
 
 A failed handler returns the job to `pending` while attempts remain.
 
-The job enters the dead-letter queue after the attempt budget is exhausted.
+The job enters the dead-letter queue after the budget runs out.
 
 ### Idempotency
 
@@ -216,19 +227,13 @@ A job that exhausts its attempts enters the `dead_letter` state.
 
 The event log records one `dead_lettered` event per exhausted job.
 
-Use the `requeue` command to return a dead-lettered job to `pending`.
-
-The job keeps its data unless the command supplies a new payload.
-
-A requeued job resets its attempt count and can fail again.
+Use `requeue` to return the job to `pending`.
 
 ### Crash recovery
 
 Startup recovery finds leases past their deadlines.
 
 Recovery consumes an attempt and records a `recovered` event.
-
-A recovered job with no attempts left enters the dead-letter queue.
 
 ### Event log
 
@@ -244,21 +249,17 @@ Each scrape computes a fresh snapshot from the SQLite store.
 
 The exporter reports four metric families.
 
-`jobqueue_jobs` counts jobs by state.
-
-`jobqueue_jobs_by_kind` counts jobs by kind and state.
-
-`jobqueue_events_total` counts events by type.
-
-`jobqueue_oldest_pending_seconds` reports the oldest pending job's age.
-
 Every known state and event type appears with an explicit zero.
 
-The output order stays stable across scrapes.
+### Web dashboard
 
-Use the `metrics` command for one snapshot or a live endpoint.
+The `web` command serves a local dashboard in a browser.
 
-Use `work -metrics-addr` to serve the same endpoint beside a worker.
+The page reads the same SQLite store as every other command.
+
+No build step or network service is required.
+
+The assets are embedded in the binary.
 
 ### Scheduling
 
@@ -309,15 +310,6 @@ Queue state
 -----------
   completed: 6
 
-Recent events (32)
------------------
-  [12:00:00] <id> requeued attempts reset to 0/3
-  [12:00:00] <id> dead_lettered attempt 3/3 exhausted: disk full
-
-Jobs (6)
---------
-  <id> kind=demo priority=0 state=completed attempts=0/3
-
 Metrics
 -------
 # HELP jobqueue_jobs Number of jobs in each state.
@@ -327,17 +319,13 @@ jobqueue_jobs{state="leased"} 0
 jobqueue_jobs{state="completed"} 6
 jobqueue_jobs{state="dead_letter"} 0
 jobqueue_jobs{state="failed"} 0
-# HELP jobqueue_events_total Number of events per event type.
-# TYPE jobqueue_events_total counter
-jobqueue_events_total{type="enqueued"} 5
-jobqueue_events_total{type="retried"} 5
-jobqueue_events_total{type="dead_lettered"} 1
-jobqueue_events_total{type="requeued"} 1
 ```
 
 The demo uses generated job IDs and current timestamps.
 
-The final counts depend on the scenario and run deadline.
+Run the web dashboard on the demo database to inspect the same data in a browser.
+
+Use `-keep` to keep the demo database after the run.
 
 ## Verification
 
@@ -376,7 +364,9 @@ A high-priority stream can delay lower-priority jobs until aging lifts them.
 
 The worker is one process and does not coordinate across hosts.
 
-The project does not provide a web interface.
+The dashboard is read-only.
+
+The project does not offer horizontal scaling yet.
 
 ## Roadmap
 
@@ -386,59 +376,23 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
-- [ ] Web UI for queue inspection.
+- [x] Browser dashboard for queue inspection.
 - [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds a browser dashboard.
 
-The new `metrics` command serves the exposition format over HTTP.
+The new `web` command serves a local inspection page.
 
-Use `-once` to print one snapshot instead.
+It also serves the JSON API and the Prometheus endpoint on one port.
 
-The `work` command can serve the same endpoint beside a worker.
+Click a job row to see its full event timeline.
 
-The demo prints the final metrics snapshot.
+The dashboard refreshes every three seconds.
 
-Each scrape reads the SQLite store and reports current state.
+The previous release added Prometheus metrics.
 
-The previous release added priority aging to prevent starvation.
+The previous release added a dead-letter queue with requeue.
 
-A pending job gains one priority point per aging interval it waits.
-
-The default aging interval is 30 seconds.
-
-The `work` command enables aging by default.
-
-Use `-aging 0` to disable aging.
-
-The store measures the wait from the job's readiness time.
-
-A scheduled job starts aging only when its `run_at` time passes.
-
-The library keeps aging opt-in, so callers keep their exact ordering.
-
-The demo now shows a low-priority job overtaking a fresher one.
-
-The previous release added a dead-letter queue for jobs that exhaust their attempts.
-
-A job enters the `dead_letter` state after its attempt budget runs out.
-
-The event log records a `dead_lettered` event for each exhausted job.
-
-The new `requeue` command returns a dead-lettered job to `pending`.
-
-The command can supply a new payload and a new attempt budget.
-
-The demo now shows the full dead-letter workflow.
-
-The previous release added durable priority dispatch.
-
-Jobs store an integer priority with a default of zero.
-
-The lease query selects ready jobs by descending priority.
-
-The migration adds `priority` to existing databases before creating its indexes.
-
-That release also preserved sub-second schedule deadlines during SQLite writes.
+The previous release added durable priority dispatch and priority aging.

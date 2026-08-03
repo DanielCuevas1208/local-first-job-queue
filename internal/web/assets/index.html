@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local-first Job Queue</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <h1 class="topbar-title">Local-first Job Queue</h1>
+      <div class="topbar-meta">
+        <span id="refresh-state" class="refresh-dot is-stale" title="Refresh state"></span>
+        <span id="last-updated" class="last-updated">connecting</span>
+        <button id="pause-btn" class="button button-small" type="button">Pause</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section id="stats" class="stats" aria-label="Queue state"></section>
+
+    <div class="grid">
+      <section class="panel" aria-label="Jobs">
+        <div class="panel-head">
+          <h2 class="panel-title">Jobs</h2>
+          <div id="state-filter" class="filter" role="group" aria-label="Filter jobs by state"></div>
+        </div>
+        <div class="table-wrap">
+          <table class="jobs-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Kind</th>
+                <th>State</th>
+                <th class="num">Priority</th>
+                <th class="num">Attempts</th>
+                <th>Created</th>
+                <th>Run at</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-table-body"></tbody>
+          </table>
+          <p id="jobs-empty" class="empty" hidden>No jobs match.</p>
+        </div>
+      </section>
+
+      <aside class="panel" aria-label="Recent events">
+        <div class="panel-head">
+          <h2 class="panel-title">Recent events</h2>
+        </div>
+        <ol id="events" class="events"></ol>
+      </aside>
+    </div>
+  </main>
+
+  <div id="drawer" class="drawer" hidden>
+    <div class="drawer-panel">
+      <div class="drawer-head">
+        <h2 id="drawer-title" class="panel-title">Job</h2>
+        <button id="drawer-close" class="button button-small" type="button" aria-label="Close details">Close</button>
+      </div>
+      <div id="drawer-body" class="drawer-body"></div>
+    </div>
+  </div>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
