@@ -22,6 +22,7 @@ Commands:
   history  View the event log for one job
   requeue  Return a dead-lettered job to the queue
   seed     Load bundled sample data
+  purge    Remove finished jobs and their events
   metrics  Expose queue state for Prometheus
   demo     Run a self-contained scenario with fault injection
 
@@ -46,6 +47,8 @@ Use <command> -help for command flags.`)
 		err = cli.Requeue(args)
 	case "seed":
 		err = cli.Seed(args)
+	case "purge":
+		err = cli.Purge(args)
 	case "metrics":
 		err = cli.Metrics(args)
 	case "demo":

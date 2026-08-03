@@ -190,6 +190,9 @@ func Demo(args []string) error {
 	if err := showPriorityAging(*kind); err != nil {
 		return err
 	}
+	if err := showRetention(*kind); err != nil {
+		return err
+	}
 
 	fmt.Println()
 	snap, err = q.Inspect()
@@ -208,6 +211,83 @@ func Demo(args []string) error {
 	fmt.Printf("\ninspect again with: jobqueue inspect -db %q\n", path)
 	fmt.Printf("inspect a job with: jobqueue history <id> -db %q\n", path)
 	fmt.Printf("requeue a dead letter with: jobqueue requeue <id> -db %q\n", path)
+	fmt.Printf("purge finished jobs with: jobqueue purge -db %q\n", path)
+	return nil
+}
+
+// showRetention demonstrates the purge workflow: preview the removal with a
+// dry run, apply it, and confirm the queue state. The segment uses its own
+// in-memory store so the scenario counts stay intact.
+func showRetention(kind string) error {
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-retention?mode=memory&cache=shared")
+	if err != nil {
+		return fmt.Errorf("open retention store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+	ctx := context.Background()
+
+	// complete enqueues one job and finishes it in one step. Each lease is
+	// unambiguous because the future job is not ready yet.
+	complete := func() error {
+		if _, err := q.Enqueue(kind, `{"name":"completed"}`); err != nil {
+			return fmt.Errorf("enqueue completed: %w", err)
+		}
+		job, err := q.Lease(ctx, kind, time.Minute)
+		if err != nil || job == nil {
+			return fmt.Errorf("lease completed: job=%v err=%v", job, err)
+		}
+		if err := q.Acknowledge(job.ID); err != nil {
+			return fmt.Errorf("ack completed: %w", err)
+		}
+		return nil
+	}
+	for i := 0; i < 2; i++ {
+		if err := complete(); err != nil {
+			return err
+		}
+	}
+
+	if _, err := q.Enqueue(kind, `{"name":"doomed"}`, queue.WithMaxAttempts(1)); err != nil {
+		return fmt.Errorf("enqueue doomed: %w", err)
+	}
+	doomed, err := q.Lease(ctx, kind, time.Minute)
+	if err != nil || doomed == nil {
+		return fmt.Errorf("lease doomed: %w", err)
+	}
+	if err := q.Fail(doomed.ID, "boom"); err != nil {
+		return fmt.Errorf("fail doomed: %w", err)
+	}
+	if _, err := q.Enqueue(kind, `{"name":"future"}`, queue.WithRunAt(time.Now().Add(time.Hour))); err != nil {
+		return fmt.Errorf("enqueue future: %w", err)
+	}
+
+	snap, err := q.Inspect()
+	if err != nil {
+		return fmt.Errorf("inspect retention: %w", err)
+	}
+	fmt.Println("\nRetention")
+	fmt.Println("---------")
+	fmt.Printf("jobs: pending=%d completed=%d dead_letter=%d\n",
+		snap.Stats[queue.StatePending], snap.Stats[queue.StateCompleted], snap.Stats[queue.StateDeadLetter])
+
+	var b strings.Builder
+	if err := runPurge(&b, q, nil, nil, true); err != nil {
+		return fmt.Errorf("retention dry run: %w", err)
+	}
+	fmt.Print("  " + b.String())
+	b.Reset()
+	if err := runPurge(&b, q, nil, nil, false); err != nil {
+		return fmt.Errorf("retention purge: %w", err)
+	}
+	fmt.Print("  " + b.String())
+
+	snap, err = q.Inspect()
+	if err != nil {
+		return fmt.Errorf("inspect after purge: %w", err)
+	}
+	fmt.Printf("after purge: pending=%d completed=%d dead_letter=%d\n",
+		snap.Stats[queue.StatePending], snap.Stats[queue.StateCompleted], snap.Stats[queue.StateDeadLetter])
 	return nil
 }
 

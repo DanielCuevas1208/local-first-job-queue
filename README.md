@@ -2,7 +2,7 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, retention, Prometheus metrics, and an append-only event log.
 
 ## Value
 
@@ -11,6 +11,8 @@ Use this project to study queue behavior without an external service.
 Every lease, retry, recovery, and acknowledgement remains visible in SQLite.
 
 The demo injects repeatable faults, so failure paths are easy to inspect.
+
+The purge command enforces retention, so finished jobs cannot grow without limit.
 
 ## Architecture
 
@@ -73,6 +75,17 @@ Inspect and requeue a dead-lettered job with these commands.
 go run . history <id> -db queue.db
 go run . requeue <id> -db queue.db
 ```
+
+Enforce retention with these commands.
+
+```text
+go run . purge -db queue.db -dry-run
+go run . purge -db queue.db -before 720h
+```
+
+The first command previews the removal.
+
+The second command removes jobs not updated in 30 days.
 
 ## Commands
 
@@ -139,6 +152,30 @@ jobqueue seed [-db <path>]
 ```
 
 The command loads three idempotent jobs for each bundled workload.
+
+### `purge`
+
+```text
+jobqueue purge [-state <state>]... [-before <duration>] [-dry-run] [-db <path>]
+```
+
+The command removes finished jobs and their events.
+
+It targets the terminal states by default.
+
+Those states are `completed`, `failed`, and `dead_letter`.
+
+Pending and leased jobs survive a default purge.
+
+Use `-state` to name different states.
+
+Use `-state pending` to clear a backlog on purpose.
+
+Use `-before` to keep recent history.
+
+The command measures age from the job's last update.
+
+Use `-dry-run` to preview the removal without changing the store.
 
 ### `metrics`
 
@@ -236,6 +273,26 @@ Every state change appends one event row.
 
 The `history` command shows one job's complete timeline.
 
+### Retention
+
+The `purge` command removes finished jobs and their events in one transaction.
+
+Each removed job takes its event rows with it.
+
+The append-only log stays consistent with the remaining jobs.
+
+The default target set is the terminal states.
+
+A purge never touches pending or leased work unless you name those states.
+
+An operator can clear a stuck backlog with `-state pending`.
+
+Use `-before` to keep jobs updated within a chosen window.
+
+A dry run reports the exact counts before any change.
+
+The removal is a single SQLite transaction, so it is atomic.
+
 ### Metrics
 
 The exporter renders queue state in the Prometheus text format.
@@ -305,6 +362,13 @@ aging interval: 100ms; a job gains one priority point per interval it waits.
 lease order: <id> (aged) then <id> (fresh)
 the waiting job outranks the fresher higher-priority job.
 
+Retention
+---------
+jobs: pending=1 completed=2 dead_letter=1
+  dry run: would remove 3 jobs and 9 events
+  removed 3 jobs and 9 events
+after purge: pending=1 completed=0 dead_letter=0
+
 Queue state
 -----------
   completed: 6
@@ -370,7 +434,7 @@ SQLite serializes writes through one store connection.
 
 A sustained backlog can exceed the writer's capacity.
 
-Jobs and events remain until an operator removes them.
+Jobs and events accumulate until an operator runs the purge command.
 
 A high-priority stream can delay lower-priority jobs until aging lifts them.
 
@@ -386,12 +450,27 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
+- [x] Retention with a purge command for finished jobs and their events.
 - [ ] Web UI for queue inspection.
 - [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds retention with the `purge` command.
+
+The command removes finished jobs and their events in one transaction.
+
+It targets the terminal states by default.
+
+Use `-state` to name different states.
+
+Use `-before` to keep recent history.
+
+Use `-dry-run` to preview a removal without changing the store.
+
+The demo now shows a retention segment with a dry run and a real purge.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 

@@ -38,5 +38,7 @@ jobs:
         run: go tool cover -func=coverage.out | tail -n 1
       - name: Build
         run: go build ./...
+      - name: Demo smoke test
+        run: go run . demo -run 1s
       - name: Benchmark queue paths
         run: go test ./internal/queue -run '^$' -bench Benchmark -benchmem -count=1
