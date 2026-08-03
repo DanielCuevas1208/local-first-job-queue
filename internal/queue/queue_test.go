@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,17 @@ import (
 func newTestStore(t *testing.T) *SQLiteStore {
 	t.Helper()
 	s, err := NewSQLiteStore("file:test_" + t.Name() + "?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func newTestStoreWithAging(t *testing.T, interval time.Duration) *SQLiteStore {
+	t.Helper()
+	s, err := NewSQLiteStore("file:test_"+t.Name()+"?mode=memory&cache=shared",
+		WithAgingInterval(interval))
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
@@ -170,8 +182,8 @@ func TestFailAndRetry(t *testing.T) {
 	}
 
 	snap, _ := q.Inspect()
-	if snap.Stats[StateFailed] != 1 {
-		t.Errorf("expected 1 failed, got %d", snap.Stats[StateFailed])
+	if snap.Stats[StateDeadLetter] != 1 {
+		t.Errorf("expected 1 dead-lettered, got %d", snap.Stats[StateDeadLetter])
 	}
 }
 
@@ -224,6 +236,165 @@ func TestPriorityOrdering(t *testing.T) {
 		if err := q.Acknowledge(got.ID); err != nil {
 			t.Fatalf("ack %s: %v", got.ID, err)
 		}
+	}
+}
+
+// TestPriorityAgingLiftsOldJob verifies that a job which has waited for several
+// aging intervals gains enough effective priority to overtake a fresher
+// higher-priority job. The store backdates the first job so the outcome does
+// not depend on wall-clock timing.
+func TestPriorityAgingLiftsOldJob(t *testing.T) {
+	s := newTestStoreWithAging(t, time.Second)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	old, err := q.Enqueue("test", `{"name":"old"}`, WithPriority(0))
+	if err != nil {
+		t.Fatalf("enqueue old: %v", err)
+	}
+	// Backdate the old job by five aging intervals so its effective priority
+	// becomes 0 + 5 = 5, above the fresh job's priority of 3.
+	if _, err := s.db.Exec(
+		`UPDATE jobs SET created_at = ? WHERE id = ?`,
+		time.Now().UTC().Add(-5*time.Second).Format(sqliteTimeFormat), old.ID); err != nil {
+		t.Fatalf("backdate old: %v", err)
+	}
+	fresh, err := q.Enqueue("test", `{"name":"fresh"}`, WithPriority(3))
+	if err != nil {
+		t.Fatalf("enqueue fresh: %v", err)
+	}
+
+	got, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if got == nil || got.ID != old.ID {
+		t.Fatalf("expected aged job %s to lease first, got %+v", old.ID, got)
+	}
+
+	got, err = q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease second: %v", err)
+	}
+	if got == nil || got.ID != fresh.ID {
+		t.Fatalf("expected fresh job %s second, got %+v", fresh.ID, got)
+	}
+}
+
+// TestPriorityAgingDisabledKeepsOrdering verifies that a store without an aging
+// interval ignores job age. A backdated low-priority job still leases after a
+// fresh high-priority job, so the default behavior is unchanged.
+func TestPriorityAgingDisabledKeepsOrdering(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	old, err := q.Enqueue("test", `{"name":"old"}`, WithPriority(0))
+	if err != nil {
+		t.Fatalf("enqueue old: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE jobs SET created_at = ? WHERE id = ?`,
+		time.Now().UTC().Add(-5*time.Second).Format(sqliteTimeFormat), old.ID); err != nil {
+		t.Fatalf("backdate old: %v", err)
+	}
+	fresh, err := q.Enqueue("test", `{"name":"fresh"}`, WithPriority(3))
+	if err != nil {
+		t.Fatalf("enqueue fresh: %v", err)
+	}
+
+	got, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if got == nil || got.ID != fresh.ID {
+		t.Fatalf("expected fresh job %s first without aging, got %+v", fresh.ID, got)
+	}
+
+	got, err = q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease second: %v", err)
+	}
+	if got == nil || got.ID != old.ID {
+		t.Fatalf("expected old job %s second, got %+v", old.ID, got)
+	}
+}
+
+// TestPriorityAgingTiesUseDeterministicOrder verifies that jobs with the same
+// effective priority fall back to the deterministic tie breakers. Two equally
+// old jobs of the same priority must lease in creation order.
+func TestPriorityAgingTiesUseDeterministicOrder(t *testing.T) {
+	s := newTestStoreWithAging(t, time.Second)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	first, err := q.Enqueue("test", `{"name":"first"}`, WithPriority(0))
+	if err != nil {
+		t.Fatalf("enqueue first: %v", err)
+	}
+	second, err := q.Enqueue("test", `{"name":"second"}`, WithPriority(0))
+	if err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+	// Backdate both jobs with one explicit base time so the aging boost is
+	// equal for both, regardless of the platform clock resolution. The two
+	// wait times stay inside the same one-second bucket, so created_at and
+	// then id decide the order.
+	base := time.Now().UTC().Add(-4 * time.Second)
+	if _, err := s.db.Exec(
+		`UPDATE jobs SET created_at = ? WHERE id = ?`,
+		base.Add(-500*time.Millisecond).Format(sqliteTimeFormat), first.ID); err != nil {
+		t.Fatalf("backdate first: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`UPDATE jobs SET created_at = ? WHERE id = ?`,
+		base.Add(500*time.Millisecond).Format(sqliteTimeFormat), second.ID); err != nil {
+		t.Fatalf("backdate second: %v", err)
+	}
+
+	got, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if got == nil || got.ID != first.ID {
+		t.Fatalf("expected first job %s to lease first on tie, got %+v", first.ID, got)
+	}
+}
+
+// TestPriorityAgingRespectsSchedule verifies that aging does not let a future
+// scheduled job bypass its run_at time. A scheduled job only ages once it is
+// ready, so a backdated run_at but far-future creation is not enough to lease.
+func TestPriorityAgingRespectsSchedule(t *testing.T) {
+	s := newTestStoreWithAging(t, time.Second)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	future, err := q.Enqueue("test", `{}`, WithPriority(100), WithRunAt(time.Now().Add(time.Hour)))
+	if err != nil {
+		t.Fatalf("enqueue future: %v", err)
+	}
+	ready, err := q.Enqueue("test", `{}`, WithPriority(0))
+	if err != nil {
+		t.Fatalf("enqueue ready: %v", err)
+	}
+
+	got, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if got == nil || got.ID != ready.ID {
+		t.Fatalf("expected ready job %s first, got %+v", ready.ID, got)
+	}
+	if err := q.Acknowledge(got.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+
+	got, err = q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease after ready job: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("expected scheduled job %s to remain pending, got %+v", future.ID, got)
 	}
 }
 
@@ -439,8 +610,292 @@ func TestRecoverExhaustsAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get job: %v", err)
 	}
-	if got.State != StateFailed {
-		t.Errorf("expected failed after recovery exhausted attempts, got %s", got.State)
+	if got.State != StateDeadLetter {
+		t.Errorf("expected dead-letter after recovery exhausted attempts, got %s", got.State)
+	}
+
+	events, err := s.GetJobEvents(job.ID)
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	last := events[len(events)-1]
+	if last.EventType != EventDeadLettered {
+		t.Errorf("expected dead_lettered event, got %s", last.EventType)
+	}
+	if last.Metadata == nil || !strings.Contains(*last.Metadata, "exhausted") {
+		t.Errorf("expected exhausted marker in metadata, got %v", last.Metadata)
+	}
+}
+
+// TestDeadLetterEventsAndRequeue verifies the full dead-letter workflow. A job
+// that exhausts its attempts enters the dead_letter state with a dead_lettered
+// event. Requeue returns it to pending with a reset attempt budget and logs a
+// requeued event. The requeued job can lease and complete again.
+func TestDeadLetterEventsAndRequeue(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	job, err := q.Enqueue("test", `{"name":"flaky"}`, WithMaxAttempts(2))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Attempt 1 fails and is retried.
+	leased, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease 1: %v", err)
+	}
+	if err := q.Fail(leased.ID, "boom 1"); err != nil {
+		t.Fatalf("fail 1: %v", err)
+	}
+
+	// Attempt 2 fails and exhausts the budget.
+	leased, err = q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease 2: %v", err)
+	}
+	if err := q.Fail(leased.ID, "boom 2"); err != nil {
+		t.Fatalf("fail 2: %v", err)
+	}
+
+	got, err := s.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get job: %v", err)
+	}
+	if got.State != StateDeadLetter {
+		t.Fatalf("expected dead_letter, got %s", got.State)
+	}
+
+	events, err := s.GetJobEvents(job.ID)
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	want := []EventType{EventEnqueued, EventLeased, EventRetried, EventLeased, EventDeadLettered}
+	if len(events) != len(want) {
+		t.Fatalf("expected %d events, got %d: %+v", len(want), len(events), events)
+	}
+	for i, et := range want {
+		if events[i].EventType != et {
+			t.Errorf("event %d: expected %s, got %s", i, et, events[i].EventType)
+		}
+	}
+	if events[len(events)-1].Metadata == nil ||
+		!strings.Contains(*events[len(events)-1].Metadata, "2/2") {
+		t.Errorf("expected attempt marker in dead_lettered metadata, got %v",
+			events[len(events)-1].Metadata)
+	}
+
+	// Requeue resets the job and logs a requeued event.
+	requeued, err := q.Requeue(job.ID, RequeueWithPayload(`{"name":"flaky","fixed":true}`))
+	if err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	if requeued.State != StatePending {
+		t.Errorf("expected pending after requeue, got %s", requeued.State)
+	}
+	if requeued.RetryCount != 0 {
+		t.Errorf("expected retry_count 0 after requeue, got %d", requeued.RetryCount)
+	}
+	if requeued.Payload != `{"name":"flaky","fixed":true}` {
+		t.Errorf("expected replaced payload, got %q", requeued.Payload)
+	}
+
+	events, err = s.GetJobEvents(job.ID)
+	if err != nil {
+		t.Fatalf("get events after requeue: %v", err)
+	}
+	last := events[len(events)-1]
+	if last.EventType != EventRequeued {
+		t.Errorf("expected requeued event, got %s", last.EventType)
+	}
+
+	// The requeued job completes normally.
+	leased, err = q.Lease(ctx, "test", time.Minute)
+	if err != nil || leased == nil || leased.ID != job.ID {
+		t.Fatalf("expected requeued job to lease, got %v %v", leased, err)
+	}
+	if err := q.Acknowledge(leased.ID); err != nil {
+		t.Fatalf("ack requeued: %v", err)
+	}
+	snap, _ := q.Inspect()
+	if snap.Stats[StateCompleted] != 1 {
+		t.Errorf("expected 1 completed, got %d", snap.Stats[StateCompleted])
+	}
+}
+
+// TestRequeueRequiresDeadLetter verifies that Requeue rejects jobs that are not
+// in the dead-letter state. A pending job must stay pending.
+func TestRequeueRequiresDeadLetter(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	job, err := q.Enqueue("test", `{}`)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, err := q.Requeue(job.ID); err == nil {
+		t.Fatal("expected error requeueing a pending job")
+	}
+
+	snap, _ := q.Inspect()
+	if snap.Stats[StatePending] != 1 {
+		t.Errorf("expected the pending job to remain, got %+v", snap.Stats)
+	}
+}
+
+// TestRequeueWithMaxAttempts verifies that the requeue attempt budget override
+// is honored and that a requeued job may exhaust its budget again.
+func TestRequeueWithMaxAttempts(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	job, err := q.Enqueue("test", `{}`, WithMaxAttempts(1))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	leased, err := q.Lease(ctx, "test", time.Minute)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if err := q.Fail(leased.ID, "boom"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	requeued, err := q.Requeue(job.ID, RequeueWithMaxAttempts(5))
+	if err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	if requeued.MaxAttempts != 5 {
+		t.Errorf("expected max_attempts 5, got %d", requeued.MaxAttempts)
+	}
+	if requeued.RetryCount != 0 {
+		t.Errorf("expected retry_count 0, got %d", requeued.RetryCount)
+	}
+}
+
+// TestGetStateKindCountsAndEventTypeCounts verifies the aggregation queries
+// used by the metrics exporter. Jobs group by kind and state, events group by
+// type, and both results keep a stable order.
+func TestGetStateKindCountsAndEventTypeCounts(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	if _, err := q.Enqueue("email", `{}`); err != nil {
+		t.Fatalf("enqueue email: %v", err)
+	}
+	// Enqueue the failing report job with a higher priority so the first lease
+	// of the report kind returns it, independent of enqueue timing.
+	flaky, err := q.Enqueue("report", `{}`, WithMaxAttempts(1), WithPriority(1))
+	if err != nil {
+		t.Fatalf("enqueue flaky: %v", err)
+	}
+	if _, err := q.Enqueue("report", `{}`); err != nil {
+		t.Fatalf("enqueue report: %v", err)
+	}
+
+	job, err := q.Lease(ctx, "email", time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("lease email: %v %v", job, err)
+	}
+	if err := q.Acknowledge(job.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	leased, err := q.Lease(ctx, "report", time.Minute)
+	if err != nil || leased == nil || leased.ID != flaky.ID {
+		t.Fatalf("lease flaky: %v %v", leased, err)
+	}
+	if err := q.Fail(leased.ID, "boom"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	counts, err := s.GetStateKindCounts()
+	if err != nil {
+		t.Fatalf("kind counts: %v", err)
+	}
+	wantKinds := []KindStateCount{
+		{Kind: "email", State: StateCompleted, Count: 1},
+		{Kind: "report", State: StateDeadLetter, Count: 1},
+		{Kind: "report", State: StatePending, Count: 1},
+	}
+	if len(counts) != len(wantKinds) {
+		t.Fatalf("expected %d kind counts, got %d: %+v", len(wantKinds), len(counts), counts)
+	}
+	for i, want := range wantKinds {
+		if counts[i] != want {
+			t.Errorf("kind count %d: expected %+v, got %+v", i, want, counts[i])
+		}
+	}
+
+	events, err := s.GetEventTypeCounts()
+	if err != nil {
+		t.Fatalf("event counts: %v", err)
+	}
+	byType := map[EventType]int{}
+	for _, e := range events {
+		byType[e.EventType] = e.Count
+	}
+	if byType[EventEnqueued] != 3 {
+		t.Errorf("expected 3 enqueued events, got %d", byType[EventEnqueued])
+	}
+	if byType[EventAcknowledged] != 1 {
+		t.Errorf("expected 1 acknowledged event, got %d", byType[EventAcknowledged])
+	}
+	if byType[EventDeadLettered] != 1 {
+		t.Errorf("expected 1 dead_lettered event, got %d", byType[EventDeadLettered])
+	}
+}
+
+// TestGetOldestPendingReadyTime verifies that the oldest pending job is found
+// by its ready time, and that an empty queue reports no value.
+func TestGetOldestPendingReadyTime(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	if _, ok, err := s.GetOldestPendingReadyTime(); err != nil || ok {
+		t.Fatalf("expected no oldest pending on empty queue, ok=%v err=%v", ok, err)
+	}
+
+	old, err := q.Enqueue("test", `{}`, WithRunAt(time.Now().Add(-time.Hour)))
+	if err != nil {
+		t.Fatalf("enqueue old: %v", err)
+	}
+	if _, err := q.Enqueue("test", `{}`); err != nil {
+		t.Fatalf("enqueue new: %v", err)
+	}
+
+	ready, ok, err := s.GetOldestPendingReadyTime()
+	if err != nil {
+		t.Fatalf("oldest pending: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected an oldest pending job")
+	}
+	if old.RunAt == nil || !ready.Equal(*old.RunAt) {
+		t.Errorf("expected ready time %v, got %v", old.RunAt, ready)
+	}
+}
+
+// TestGetStateKindCountsEmptyQueue verifies the aggregation queries return
+// empty results for a fresh database.
+func TestGetStateKindCountsEmptyQueue(t *testing.T) {
+	s := newTestStore(t)
+
+	counts, err := s.GetStateKindCounts()
+	if err != nil {
+		t.Fatalf("kind counts: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Errorf("expected no kind counts, got %+v", counts)
+	}
+	events, err := s.GetEventTypeCounts()
+	if err != nil {
+		t.Fatalf("event counts: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected no event counts, got %+v", events)
 	}
 }
 

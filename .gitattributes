@@ -1,0 +1,16 @@
+# Normalize Go source to LF so formatting checks are stable across platforms.
+*.go text eol=lf
+
+# Markdown and YAML also normalize to LF.
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# PowerShell scripts stay CRLF, which Windows shells expect.
+*.ps1 text eol=crlf
+
+# Text artifacts that must never be modified by Git.
+*.db binary
+*.db-wal binary
+*.db-shm binary
+*.db-journal binary
