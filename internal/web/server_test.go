@@ -289,3 +289,99 @@ func TestHealthz(t *testing.T) {
 		t.Errorf("expected ok body, got %q", rec.Body.String())
 	}
 }
+
+// TestBasicAuthGuardsPages verifies that a server configured with credentials
+// rejects anonymous requests with a 401 and the browser prompt header. The
+// health endpoint stays open so load balancers can probe readiness.
+func TestBasicAuthGuardsPages(t *testing.T) {
+	s, err := queue.NewSQLiteStore("file:web_auth_" + t.Name() + "?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	srv, err := New(s, WithBasicAuth("operator", "hunter2"))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	h := srv.Handler()
+
+	rec := get(t, h, "/")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for anonymous dashboard, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("WWW-Authenticate"); !strings.Contains(got, "Basic") {
+		t.Errorf("expected WWW-Authenticate Basic header, got %q", got)
+	}
+
+	api := get(t, h, "/api/jobs")
+	if api.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for anonymous API, got %d", api.Code)
+	}
+
+	health := get(t, h, "/healthz")
+	if health.Code != http.StatusOK {
+		t.Fatalf("expected healthz to stay open, got %d", health.Code)
+	}
+}
+
+// TestBasicAuthAcceptsValidCredentials verifies that the configured credentials
+// unlock the dashboard, the JSON API, and the static assets.
+func TestBasicAuthAcceptsValidCredentials(t *testing.T) {
+	s, err := queue.NewSQLiteStore("file:web_auth_ok_" + t.Name() + "?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	srv, err := New(s, WithBasicAuth("operator", "hunter2"))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	h := srv.Handler()
+
+	for _, path := range []string{"/", "/api/jobs", "/api/summary", "/static/app.css"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.SetBasicAuth("operator", "hunter2")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("path %s: expected 200 with valid credentials, got %d", path, rec.Code)
+		}
+	}
+}
+
+// TestBasicAuthRejectsWrongCredentials verifies that a wrong password and a
+// wrong username both receive a 401, so callers cannot tell them apart.
+func TestBasicAuthRejectsWrongCredentials(t *testing.T) {
+	s, err := queue.NewSQLiteStore("file:web_auth_wrong_" + t.Name() + "?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	srv, err := New(s, WithBasicAuth("operator", "hunter2"))
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	h := srv.Handler()
+
+	cases := []struct {
+		name, user, pass string
+	}{
+		{"wrong password", "operator", "wrong"},
+		{"wrong username", "admin", "hunter2"},
+		{"empty credentials", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/jobs", nil)
+			req.SetBasicAuth(tc.user, tc.pass)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("expected 401, got %d", rec.Code)
+			}
+		})
+	}
+}

@@ -1,6 +1,9 @@
 package cli
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestDashboardURL verifies the helper that turns a listen address into a
 // clickable URL. A bare port becomes localhost so the printed link always
@@ -18,6 +21,24 @@ func TestDashboardURL(t *testing.T) {
 	for _, tc := range cases {
 		if got := dashboardURL(tc.in); got != tc.want {
 			t.Errorf("dashboardURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestWebRequiresBothCredentials verifies that -user and -pass must be supplied
+// together. Setting only one is a configuration error, not a silent one.
+func TestWebRequiresBothCredentials(t *testing.T) {
+	cases := [][]string{
+		{"-user", "alice"},
+		{"-pass", "secret"},
+	}
+	for _, args := range cases {
+		err := Web(args)
+		if err == nil {
+			t.Fatalf("Web(%v) should fail with one credential missing", args)
+		}
+		if !strings.Contains(err.Error(), "must be set together") {
+			t.Errorf("Web(%v) error = %q, want the pairing message", args, err)
 		}
 	}
 }

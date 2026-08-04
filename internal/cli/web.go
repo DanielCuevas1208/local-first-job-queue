@@ -15,12 +15,19 @@ import (
 // Web serves a read-only inspection dashboard over HTTP. The dashboard reads
 // the same SQLite store as the other commands, so it shows live queue state
 // without stopping a worker. The server also exposes a small JSON API under
-// /api for scripts and other tools.
+// /api for scripts and other tools. When -user and -pass are set, every page
+// and API route requires those HTTP Basic credentials.
 func Web(args []string) error {
 	fs := flag.NewFlagSet("web", flag.ExitOnError)
 	addr := fs.String("addr", ":8080", "listen address for the dashboard")
 	dbPath := fs.String("db", "queue.db", "database path")
+	user := fs.String("user", "", "username required by the dashboard (empty disables auth)")
+	pass := fs.String("pass", "", "password required by the dashboard (empty disables auth)")
 	fs.Parse(args)
+
+	if (*user == "") != (*pass == "") {
+		return fmt.Errorf("-user and -pass must be set together")
+	}
 
 	store, err := queue.NewSQLiteStore(*dbPath)
 	if err != nil {
@@ -28,7 +35,11 @@ func Web(args []string) error {
 	}
 	defer store.Close()
 
-	srv, err := web.New(store)
+	opts := []web.Option{}
+	if *user != "" {
+		opts = append(opts, web.WithBasicAuth(*user, *pass))
+	}
+	srv, err := web.New(store, opts...)
 	if err != nil {
 		return fmt.Errorf("new dashboard: %w", err)
 	}

@@ -5,6 +5,7 @@
 package web
 
 import (
+	"crypto/subtle"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -45,17 +46,54 @@ var orderedStates = []queue.JobState{
 type Server struct {
 	store *queue.SQLiteStore
 	tmpls *template.Template
+	auth  *basicAuth
+}
+
+// Option configures a Server.
+type Option func(*Server)
+
+// WithBasicAuth guards every dashboard page and JSON endpoint with HTTP Basic
+// authentication. The health endpoint stays open so load balancers can probe
+// readiness without credentials. Use it when the dashboard is reachable from a
+// network that is not fully trusted.
+func WithBasicAuth(username, password string) Option {
+	return func(s *Server) {
+		s.auth = &basicAuth{username: username, password: password}
+	}
+}
+
+// basicAuth holds the credentials that a protected dashboard accepts. The
+// comparison uses constant-time routines so a timing probe cannot recover the
+// stored password.
+type basicAuth struct {
+	username string
+	password string
+}
+
+// check reports whether the supplied credentials match the configured ones.
+func (a *basicAuth) check(user, pass string) bool {
+	if a == nil {
+		return true
+	}
+	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(a.username))
+	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(a.password))
+	return userOK&passOK == 1
 }
 
 // New returns a Server that reads from store. Templates and static assets are
-// embedded in the binary, so the command runs from any directory.
-func New(store *queue.SQLiteStore) (*Server, error) {
+// embedded in the binary, so the command runs from any directory. Options
+// configure behaviour such as access control.
+func New(store *queue.SQLiteStore, opts ...Option) (*Server, error) {
 	tmpls, err := template.New("").Funcs(template.FuncMap{"fmtTime": fmtTime}).
 		ParseFS(templateFS, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
 	}
-	return &Server{store: store, tmpls: tmpls}, nil
+	s := &Server{store: store, tmpls: tmpls}
+	for _, o := range opts {
+		o(s)
+	}
+	return s, nil
 }
 
 // fmtTime renders a timestamp in the same UTC form the dashboard table uses.
@@ -81,7 +119,10 @@ func formatTime(t time.Time) string {
 	return t.UTC().Format("2006-01-02 15:04:05Z")
 }
 
-// Handler returns the HTTP handler with all dashboard and API routes.
+// Handler returns the HTTP handler with all dashboard and API routes. When the
+// server has credentials configured, every route except /healthz requires valid
+// Basic authentication. The health probe stays open so load balancers can check
+// readiness without a credential.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.handleIndex)
@@ -91,7 +132,30 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/jobs/{id}", s.handleAPIJob)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.Handle("GET /static/", http.FileServer(http.FS(staticFS)))
-	return mux
+
+	if s.auth == nil {
+		return mux
+	}
+	return s.requireAuth(mux)
+}
+
+// requireAuth wraps a handler so every request must present the configured
+// credentials. A missing or wrong Authorization header yields a 401 with the
+// WWW-Authenticate header that makes browsers show their credential prompt.
+func (s *Server) requireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || !s.auth.check(user, pass) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="local-first-job-queue"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // stateCount reports how many jobs share one state.

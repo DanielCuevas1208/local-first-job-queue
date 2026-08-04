@@ -10,6 +10,8 @@ It provides Prometheus metrics and an append-only event log.
 
 It includes a browser dashboard and shared-file horizontal scaling.
 
+The dashboard can require HTTP Basic credentials for shared deployments.
+
 ## Value
 
 Use this project to study queue behavior without an external service.
@@ -55,6 +57,7 @@ go build -o jobqueue .
 ./jobqueue enqueue -kind email -payload '{"to":"user@example.com"}' -priority 20
 ./jobqueue work -kind email
 ./jobqueue inspect
+./jobqueue web
 ```
 
 Use `-priority` to place urgent work ahead of normal work.
@@ -123,7 +126,7 @@ jobqueue enqueue -kind <type> -payload <json> [-priority <n>] [-idempotency-key 
 ### `work`
 
 ```text
-jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-metrics-addr <addr>] [-db <path>]
+jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-metrics-addr <addr>] [-web-addr <addr>] [-web-user <name>] [-web-pass <password>] [-db <path>]
 ```
 
 The worker recovers expired leases when it starts.
@@ -135,6 +138,10 @@ A job gains one priority point per interval it waits.
 Use `-aging 0` to disable aging.
 
 Use `-metrics-addr` to serve Prometheus metrics beside the worker.
+
+Use `-web-addr` to serve the web dashboard beside the worker.
+
+Use `-web-user` and `-web-pass` to require credentials for that dashboard.
 
 ### `inspect`
 
@@ -199,7 +206,7 @@ The demo combines priority, retries, panic recovery, crash recovery, scheduling,
 ### `web`
 
 ```text
-jobqueue web [-addr <addr>] [-db <path>]
+jobqueue web [-addr <addr>] [-db <path>] [-user <name>] [-pass <password>]
 ```
 
 The command serves a read-only browser dashboard.
@@ -213,6 +220,10 @@ Each job page shows its payload and full event timeline.
 The page refreshes itself every five seconds.
 
 The server also exposes a JSON API under `/api`.
+
+Use `-user` and `-pass` to require credentials for every page and API route.
+
+The health endpoint stays open so load balancers can probe it.
 
 Use `-addr 127.0.0.1:8080` to bind to one interface.
 
@@ -366,6 +377,28 @@ The dashboard never writes to the store.
 
 It is safe to run beside a worker on the same database.
 
+Use `work -web-addr` to serve the dashboard beside a worker.
+
+### Authentication
+
+Use `-user` and `-pass` to protect the dashboard with HTTP Basic Auth.
+
+Every page and API route then requires the credentials.
+
+The health endpoint stays open so load balancers can probe readiness.
+
+A wrong or missing credential returns a 401 response.
+
+The browser shows its own prompt for the username and password.
+
+The comparison uses constant-time routines to resist timing probes.
+
+The password travels in clear text unless you add TLS.
+
+Put the dashboard behind a reverse proxy for HTTPS.
+
+The dashboard stays read-only, so a leaked credential cannot change jobs.
+
 ### Scheduling
 
 A scheduled job stores its earliest lease time in `run_at`.
@@ -453,6 +486,18 @@ The JSON API returns the same view for scripts.
 curl -s http://localhost:8080/api/jobs?state=pending&limit=2
 ```
 
+Protect the dashboard with credentials for a shared deployment.
+
+```text
+./jobqueue web -db queue.db -user admin -pass 'change-me'
+```
+
+Scripts pass the credentials in the Authorization header.
+
+```text
+curl -s -u admin:'change-me' http://localhost:8080/api/jobs?state=pending&limit=2
+```
+
 ```json
 {
   "jobs": [
@@ -515,7 +560,7 @@ Verification status: tests, vet, build, and benchmarks pass locally and in CI.
 
 Race tests run in CI on Ubuntu.
 
-The web tests cover the dashboard, the JSON API, and payload escaping.
+The web tests cover the dashboard, the JSON API, payload escaping, and access control.
 
 The shared-file tests cover multi-process leases, recovery, and worker scaling.
 
@@ -533,9 +578,9 @@ Workers share one file, so scaling across hosts needs a shared filesystem.
 
 The dashboard is read-only and does not manage jobs.
 
-The dashboard does not authenticate access.
+Basic Auth sends the password in clear text without TLS.
 
-Run it on a trusted network or bind it to localhost.
+Add a reverse proxy with HTTPS for any shared deployment.
 
 ## Roadmap
 
@@ -547,11 +592,26 @@ Run it on a trusted network or bind it to localhost.
 - [x] Prometheus metrics for queue inspection.
 - [x] Browser dashboard for queue inspection.
 - [x] Horizontal scaling with a shared SQLite file.
-- [ ] Authenticated dashboard access for shared deployments.
+- [x] Authenticated dashboard access for shared deployments.
+- [ ] Job retention policies and event log cleanup.
 
 ### Release notes
 
-This release adds horizontal scaling with a shared SQLite file.
+This release adds optional authentication for the web dashboard.
+
+The `web` command accepts `-user` and `-pass` credentials.
+
+Every page and JSON API route then requires HTTP Basic Auth.
+
+The health endpoint stays open for load balancers.
+
+The `work` command passes the same options to its dashboard.
+
+Constant-time comparison resists timing attacks on the password.
+
+New tests cover anonymous, valid, and wrong credentials.
+
+The previous release added horizontal scaling with a shared SQLite file.
 
 A lease claim now runs as one atomic SQL statement.
 
