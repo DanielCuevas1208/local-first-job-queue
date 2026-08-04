@@ -2,7 +2,9 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, an append-only event log, and shared-file scaling.
+
+Two or more worker processes can drain one SQLite file.
 
 ## Value
 
@@ -26,6 +28,8 @@ The queue separates durable state from worker execution.
 A job starts as `pending`.
 
 A worker claims it with a time-limited lease.
+
+The lease claim is one atomic SQL statement.
 
 The worker acknowledges success or records failure.
 
@@ -74,6 +78,17 @@ go run . history <id> -db queue.db
 go run . requeue <id> -db queue.db
 ```
 
+Run two worker processes against the same file.
+
+Each worker claims a disjoint set of jobs.
+
+```text
+jobqueue work -kind email -db queue.db &
+jobqueue work -kind email -db queue.db &
+```
+
+Leases keep the two workers from processing the same job twice.
+
 ## Commands
 
 ### `enqueue`
@@ -93,6 +108,10 @@ jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <durati
 ```
 
 The worker recovers expired leases when it starts.
+
+You may run many worker processes against one file.
+
+Each process leases distinct jobs, so no job runs twice.
 
 Priority aging is enabled by default with a 30-second interval.
 
@@ -170,6 +189,10 @@ A lease gives one worker temporary ownership of a job.
 
 An expired lease becomes recoverable.
 
+A worker claims a lease with one atomic SQL statement.
+
+Two workers cannot lease the same job, even on one file.
+
 ### Priority dispatch
 
 Ready jobs with higher priority values lease first.
@@ -229,6 +252,26 @@ Startup recovery finds leases past their deadlines.
 Recovery consumes an attempt and records a `recovered` event.
 
 A recovered job with no attempts left enters the dead-letter queue.
+
+### Shared-file scaling
+
+Many worker processes can drain one SQLite file.
+
+Each process opens its own store connection.
+
+WAL mode lets readers run in parallel.
+
+The lease claim is a single atomic statement.
+
+The state guard stops two processes from claiming one job.
+
+An acknowledgement carries the lease deadline.
+
+A stale worker cannot finish a job another process owns.
+
+Two processes cannot recover the same lease twice.
+
+The tests run this path with two stores on one file.
 
 ### Event log
 
@@ -364,17 +407,21 @@ Verification status: tests, vet, build, and benchmarks pass locally and in CI.
 
 Race tests run in CI on Ubuntu.
 
+The shared-file tests cover leases, recovery, and acknowledgement across two stores.
+
 ## Limitations
 
 SQLite serializes writes through one store connection.
 
 A sustained backlog can exceed the writer's capacity.
 
+The shared file works best on one host.
+
+Network filesystems can weaken SQLite file locking.
+
 Jobs and events remain until an operator removes them.
 
 A high-priority stream can delay lower-priority jobs until aging lifts them.
-
-The worker is one process and does not coordinate across hosts.
 
 The project does not provide a web interface.
 
@@ -386,12 +433,26 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
+- [x] Horizontal scaling with a shared SQLite file.
 - [ ] Web UI for queue inspection.
-- [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release makes the queue safe for shared-file scaling.
+
+The lease claim is now one atomic SQL statement.
+
+A second worker cannot lease a job the first worker holds.
+
+Recovery checks the row count, so two processes cannot double-recover.
+
+An acknowledgement carries the lease deadline.
+
+A stale worker cannot finish a job another process owns.
+
+The tests open two stores on one file to prove the behavior.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 

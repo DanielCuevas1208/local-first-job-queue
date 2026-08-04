@@ -207,8 +207,19 @@ func (q *Queue) Lease(ctx context.Context, kind string, leaseDuration time.Durat
 	return job, nil
 }
 
+// Acknowledge marks a leased job completed. The method is kept for callers that
+// hold the lease token separately; see AcknowledgeLease for the lease-aware
+// form used by workers.
 func (q *Queue) Acknowledge(jobID string) error {
-	if err := q.store.CompleteJob(jobID); err != nil {
+	return q.AcknowledgeLease(jobID, nil)
+}
+
+// AcknowledgeLease marks a leased job completed. When leasedUntil is non-nil,
+// the completion only applies while the job still holds that lease deadline. A
+// worker that finished after its lease was recovered by another process gets an
+// error instead of completing a job it no longer owns.
+func (q *Queue) AcknowledgeLease(jobID string, leasedUntil *time.Time) error {
+	if err := q.store.CompleteJob(jobID, leasedUntil); err != nil {
 		return fmt.Errorf("complete job: %w", err)
 	}
 	ev := Event{
@@ -222,7 +233,17 @@ func (q *Queue) Acknowledge(jobID string) error {
 	return nil
 }
 
+// Fail records a failure for a leased job. The method is kept for callers that
+// hold the lease token separately; see FailLease for the lease-aware form used
+// by workers.
 func (q *Queue) Fail(jobID string, errMsg string) error {
+	return q.FailLease(jobID, nil, errMsg)
+}
+
+// FailLease records a failure for a leased job. When leasedUntil is non-nil,
+// the update only applies while the job still holds that lease deadline, so a
+// stale failure cannot corrupt a lease another worker now owns.
+func (q *Queue) FailLease(jobID string, leasedUntil *time.Time, errMsg string) error {
 	job, err := q.store.GetJob(jobID)
 	if err != nil {
 		return fmt.Errorf("get job: %w", err)
@@ -232,7 +253,7 @@ func (q *Queue) Fail(jobID string, errMsg string) error {
 	// The current attempt is RetryCount plus one. Retry only when an additional
 	// attempt still fits inside the limit.
 	shouldRetry := job.RetryCount+1 < job.MaxAttempts
-	if err := q.store.FailJob(jobID, shouldRetry); err != nil {
+	if err := q.store.FailJob(jobID, shouldRetry, leasedUntil); err != nil {
 		return fmt.Errorf("fail job: %w", err)
 	}
 

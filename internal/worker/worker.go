@@ -124,13 +124,13 @@ func (w *Worker) processOne(ctx context.Context) {
 	err = w.runHandler(runCtx, *job)
 	if err != nil {
 		log.Printf("job %s failed: %v", job.ID, err)
-		if ackErr := w.queue.Fail(job.ID, err.Error()); ackErr != nil {
+		if ackErr := w.queue.FailLease(job.ID, job.LeasedUntil, err.Error()); ackErr != nil {
 			log.Printf("fail error for %s: %v", job.ID, ackErr)
 		}
 		return
 	}
 
-	if err := w.queue.Acknowledge(job.ID); err != nil {
+	if err := w.queue.AcknowledgeLease(job.ID, job.LeasedUntil); err != nil {
 		log.Printf("ack error for %s: %v", job.ID, err)
 	}
 }

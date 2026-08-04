@@ -207,43 +207,34 @@ func (s *SQLiteStore) GetJob(id string) (Job, error) {
 	return scanJob(row)
 }
 
+// LeaseJob claims the next ready pending job for one kind and returns it. The
+// claim is a single UPDATE statement, so it is atomic. Two workers that share
+// one SQLite file cannot lease the same job: only one process wins the write
+// lock, and the state guard skips a job another worker already claimed.
 func (s *SQLiteStore) LeaseJob(kind string, leaseDuration time.Duration) (*Job, error) {
 	now := time.Now().UTC()
 	until := now.Add(leaseDuration)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
 
 	orderBy, orderArgs := s.pendingOrderBy(now)
-	query := `SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
-		 FROM jobs WHERE kind = ? AND state = 'pending'
-		   AND (run_at IS NULL OR run_at <= ?) ORDER BY ` + orderBy + ` LIMIT 1`
-	args := append([]any{kind, now.Format(sqliteTimeFormat)}, orderArgs...)
-	row := tx.QueryRow(query, args...)
+	query := `UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?
+		WHERE id IN (
+			SELECT id FROM jobs
+			WHERE kind = ? AND state = 'pending' AND (run_at IS NULL OR run_at <= ?)
+			ORDER BY ` + orderBy + ` LIMIT 1
+		) AND state = 'pending'
+		RETURNING id, kind, payload, state, retry_count, max_attempts, priority,
+			idempotency_key, created_at, updated_at, leased_until, run_at`
+	args := append(
+		[]any{until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), kind, now.Format(sqliteTimeFormat)},
+		orderArgs...)
+	row := s.db.QueryRow(query, args...)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query pending: %w", err)
+		return nil, fmt.Errorf("lease job: %w", err)
 	}
-
-	_, err = tx.Exec(
-		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ? WHERE id = ? AND state = 'pending'`,
-		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), job.ID)
-	if err != nil {
-		return nil, fmt.Errorf("update lease: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit lease: %w", err)
-	}
-
-	job.State = StateLeased
-	job.LeasedUntil = &until
-	job.UpdatedAt = now
 	return &job, nil
 }
 
@@ -253,48 +244,38 @@ func (s *SQLiteStore) LeaseJob(kind string, leaseDuration time.Duration) (*Job, 
 func (s *SQLiteStore) LeaseJobByID(id string, leaseDuration time.Duration) (*Job, error) {
 	now := time.Now().UTC()
 	until := now.Add(leaseDuration)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
 
-	row := tx.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
-		 FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRow(
+		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?
+		 WHERE id = ? AND state = 'pending'
+		 RETURNING id, kind, payload, state, retry_count, max_attempts, priority,
+			idempotency_key, created_at, updated_at, leased_until, run_at`,
+		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), id)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("job %s not found", id)
+		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query job: %w", err)
+		return nil, fmt.Errorf("lease job by id: %w", err)
 	}
-	if job.State != StatePending {
-		return nil, fmt.Errorf("job %s is %s, not pending", id, job.State)
-	}
-
-	_, err = tx.Exec(
-		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ? WHERE id = ? AND state = 'pending'`,
-		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), id)
-	if err != nil {
-		return nil, fmt.Errorf("update lease: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit lease: %w", err)
-	}
-
-	job.State = StateLeased
-	job.LeasedUntil = &until
-	job.UpdatedAt = now
 	return &job, nil
 }
 
-func (s *SQLiteStore) CompleteJob(id string) error {
+// CompleteJob marks a leased job completed. When leasedUntil is non-nil, the
+// update also requires the job to still carry that lease deadline. A worker
+// that finishes after its lease expired and was recovered by another process
+// then affects no row, so a stale acknowledgement cannot complete a job it no
+// longer owns.
+func (s *SQLiteStore) CompleteJob(id string, leasedUntil *time.Time) error {
 	now := time.Now().UTC()
-	result, err := s.db.Exec(
-		`UPDATE jobs SET state = 'completed', leased_until = NULL, updated_at = ?
-		 WHERE id = ? AND state = 'leased'`,
-		now.Format(sqliteTimeFormat), id)
+	stmt := `UPDATE jobs SET state = 'completed', leased_until = NULL, updated_at = ?
+		 WHERE id = ? AND state = 'leased'`
+	args := []any{now.Format(sqliteTimeFormat), id}
+	if leasedUntil != nil {
+		stmt += ` AND leased_until = ?`
+		args = append(args, leasedUntil.UTC().Format(sqliteTimeFormat))
+	}
+	result, err := s.db.Exec(stmt, args...)
 	if err != nil {
 		return fmt.Errorf("complete job: %w", err)
 	}
@@ -305,26 +286,31 @@ func (s *SQLiteStore) CompleteJob(id string) error {
 	return nil
 }
 
-func (s *SQLiteStore) FailJob(id string, retry bool) error {
+// FailJob records a failure for a leased job. When retry is true the job
+// returns to the pending state; otherwise it enters the dead-letter state. When
+// leasedUntil is non-nil, the update also requires the job to still carry that
+// lease deadline, so a stale failure cannot corrupt a lease another worker now
+// holds.
+func (s *SQLiteStore) FailJob(id string, retry bool, leasedUntil *time.Time) error {
 	now := time.Now().UTC()
-	if retry {
-		_, err := s.db.Exec(
-			`UPDATE jobs SET state = 'pending', retry_count = retry_count + 1, leased_until = NULL, updated_at = ?
-			 WHERE id = ? AND state = 'leased'`,
-			now.Format(sqliteTimeFormat), id)
-		if err != nil {
-			return fmt.Errorf("retry job: %w", err)
-		}
-		return nil
+	target := "pending"
+	if !retry {
+		target = "dead_letter"
 	}
-	// The attempt budget is exhausted. The job moves to the dead-letter state
-	// with its final attempt count, so the event log shows the full budget.
-	_, err := s.db.Exec(
-		`UPDATE jobs SET state = 'dead_letter', retry_count = retry_count + 1, leased_until = NULL, updated_at = ?
-		 WHERE id = ? AND state = 'leased'`,
-		now.Format(sqliteTimeFormat), id)
+	stmt := `UPDATE jobs SET state = ?, retry_count = retry_count + 1, leased_until = NULL, updated_at = ?
+		 WHERE id = ? AND state = 'leased'`
+	args := []any{target, now.Format(sqliteTimeFormat), id}
+	if leasedUntil != nil {
+		stmt += ` AND leased_until = ?`
+		args = append(args, leasedUntil.UTC().Format(sqliteTimeFormat))
+	}
+	result, err := s.db.Exec(stmt, args...)
 	if err != nil {
-		return fmt.Errorf("dead-letter job: %w", err)
+		return fmt.Errorf("%s job: %w", target, err)
+	}
+	n, _ := result.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("job %s not found or not leased", id)
 	}
 	return nil
 }
@@ -368,8 +354,10 @@ func (s *SQLiteStore) RequeueJob(id string, maxAttempts int, payload *string) (J
 // RecoverOrphanedLeases finds jobs whose lease deadline passed and returns
 // them to the pending state. Each recovery consumes one attempt. When no
 // attempt remains, the job enters the dead-letter state instead of looping.
-// The returned slice reports the jobs that were touched, with their updated
-// retry counters, so callers can log a recovery event per job.
+// The returned slice reports the jobs this store actually recovered, with their
+// updated retry counters, so callers can log a recovery event per job. When
+// two workers race to recover the same lease, only the winner's update matches
+// a row; the loser skips that job and it is absent from its result.
 func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 	now := time.Now().UTC()
 	rows, err := s.db.Query(
@@ -389,36 +377,56 @@ func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 		}
 		orphans = append(orphans, j)
 	}
-	if len(orphans) == 0 {
-		return nil, nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate orphaned jobs: %w", err)
 	}
 
+	// Recovered holds only the jobs whose state update won the race. A job that
+	// another worker already recovered stays out of the result so its event is
+	// logged once.
+	recovered := make([]Job, 0, len(orphans))
 	for i := range orphans {
 		j := &orphans[i]
 		nextAttempt := j.RetryCount + 1
 		if nextAttempt >= j.MaxAttempts {
-			_, err := s.db.Exec(
+			res, err := s.db.Exec(
 				`UPDATE jobs SET state = 'dead_letter', retry_count = ?, leased_until = NULL, updated_at = ?
 				 WHERE id = ? AND state = 'leased'`,
 				nextAttempt, now.Format(sqliteTimeFormat), j.ID)
 			if err != nil {
 				return nil, fmt.Errorf("dead-letter orphaned job %s: %w", j.ID, err)
 			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return nil, fmt.Errorf("rows affected for %s: %w", j.ID, err)
+			}
+			if n == 0 {
+				continue
+			}
 			j.RetryCount = nextAttempt
 			j.State = StateDeadLetter
+			recovered = append(recovered, *j)
 			continue
 		}
-		_, err := s.db.Exec(
+		res, err := s.db.Exec(
 			`UPDATE jobs SET state = 'pending', retry_count = ?, leased_until = NULL, updated_at = ?
 			 WHERE id = ? AND state = 'leased'`,
 			nextAttempt, now.Format(sqliteTimeFormat), j.ID)
 		if err != nil {
 			return nil, fmt.Errorf("recover job %s: %w", j.ID, err)
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("rows affected for %s: %w", j.ID, err)
+		}
+		if n == 0 {
+			continue
+		}
 		j.RetryCount = nextAttempt
 		j.State = StatePending
+		recovered = append(recovered, *j)
 	}
-	return orphans, nil
+	return recovered, nil
 }
 
 // pendingOrderBy builds the ORDER BY clause for ready jobs. When aging is
