@@ -68,9 +68,45 @@ type KindStateCount struct {
 	Count int      `json:"count"`
 }
 
-// EventTypeCount reports how many events share one event type. The count is
-// monotonic while the event log keeps every row.
+// EventTypeCount reports how many events share one event type. The count grows
+// as jobs progress and can drop when a retention run trims the log.
 type EventTypeCount struct {
 	EventType EventType `json:"event_type"`
 	Count     int       `json:"count"`
+}
+
+// RetentionSource identifies who started a retention run. The prune command
+// records manual runs; the worker records the automatic runs it performs on a
+// schedule. The source lets operators and exporters see where retention
+// activity came from.
+type RetentionSource string
+
+const (
+	// RetentionSourceManual labels runs from the prune command or a direct
+	// Prune call.
+	RetentionSourceManual RetentionSource = "manual"
+	// RetentionSourceAuto labels runs the worker performs on its own schedule.
+	RetentionSourceAuto RetentionSource = "auto"
+)
+
+// RetentionRun records one retention pass: when it ran, who ran it, the policy
+// it applied, and how many rows it removed. The store keeps the log append-only
+// so operators can review what retention has done.
+type RetentionRun struct {
+	ID              int64           `json:"id"`
+	StartedAt       time.Time       `json:"started_at"`
+	Source          RetentionSource `json:"source"`
+	MaxJobAge       string          `json:"max_job_age"`
+	MaxEventsPerJob int             `json:"max_events_per_job"`
+	JobsRemoved     int             `json:"jobs_removed"`
+	EventsRemoved   int             `json:"events_removed"`
+}
+
+// RetentionSourceCount reports how many retention runs one source recorded and
+// what those runs removed. Metrics exporters group counters by source.
+type RetentionSourceCount struct {
+	Source        RetentionSource `json:"source"`
+	Runs          int             `json:"runs"`
+	JobsRemoved   int             `json:"jobs_removed"`
+	EventsRemoved int             `json:"events_removed"`
 }

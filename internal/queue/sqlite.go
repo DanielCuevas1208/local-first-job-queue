@@ -3,6 +3,7 @@ package queue
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -79,8 +80,18 @@ func migrate(db *sql.DB) error {
 			timestamp TEXT NOT NULL,
 			FOREIGN KEY (job_id) REFERENCES jobs(id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS retention_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			started_at TEXT NOT NULL,
+			source TEXT NOT NULL,
+			max_job_age TEXT NOT NULL,
+			max_events_per_job INTEGER NOT NULL,
+			jobs_removed INTEGER NOT NULL,
+			events_removed INTEGER NOT NULL
+		)`,
 		`PRAGMA journal_mode=WAL`,
 		`PRAGMA busy_timeout=5000`,
+		`PRAGMA synchronous=NORMAL`,
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
@@ -100,6 +111,7 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_jobs_kind_priority ON jobs(kind, state, priority DESC, run_at, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_retention_runs_source ON retention_runs(source)`,
 	}
 	for _, q := range indexes {
 		if _, err := db.Exec(q); err != nil {
@@ -147,6 +159,14 @@ func trunc(s string, n int) string {
 
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
+}
+
+// DB exposes the underlying SQL connection for advanced inspection and
+// maintenance tooling. Ordinary callers use the store methods, which keep the
+// schema and timestamp format consistent. The connection pool stays bounded to
+// one writer, matching the queue's serialized-write model.
+func (s *SQLiteStore) DB() *sql.DB {
+	return s.db
 }
 
 // InsertJob stores a new job. When the job carries an idempotency key that
@@ -207,85 +227,62 @@ func (s *SQLiteStore) GetJob(id string) (Job, error) {
 	return scanJob(row)
 }
 
+// LeaseJob claims the next ready job for a kind. The claim runs as one UPDATE
+// statement that selects and leases the best pending job in a single write, so
+// several worker processes can share one SQLite file without ever leasing the
+// same job twice. When no job is ready, the result is nil.
 func (s *SQLiteStore) LeaseJob(kind string, leaseDuration time.Duration) (*Job, error) {
 	now := time.Now().UTC()
 	until := now.Add(leaseDuration)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
 
 	orderBy, orderArgs := s.pendingOrderBy(now)
-	query := `SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
-		 FROM jobs WHERE kind = ? AND state = 'pending'
-		   AND (run_at IS NULL OR run_at <= ?) ORDER BY ` + orderBy + ` LIMIT 1`
-	args := append([]any{kind, now.Format(sqliteTimeFormat)}, orderArgs...)
-	row := tx.QueryRow(query, args...)
+	query := `UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?
+		WHERE id = (
+			SELECT id FROM jobs
+			WHERE kind = ? AND state = 'pending' AND (run_at IS NULL OR run_at <= ?)
+			ORDER BY ` + orderBy + ` LIMIT 1
+		)
+		RETURNING id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at`
+	args := append([]any{until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), kind, now.Format(sqliteTimeFormat)}, orderArgs...)
+
+	row := s.db.QueryRow(query, args...)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query pending: %w", err)
+		return nil, fmt.Errorf("claim job: %w", err)
 	}
-
-	_, err = tx.Exec(
-		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ? WHERE id = ? AND state = 'pending'`,
-		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), job.ID)
-	if err != nil {
-		return nil, fmt.Errorf("update lease: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit lease: %w", err)
-	}
-
-	job.State = StateLeased
-	job.LeasedUntil = &until
-	job.UpdatedAt = now
 	return &job, nil
 }
 
 // LeaseJobByID leases one specific job by its ID. It is used by tools and tests
-// that need to simulate a worker leasing and then abandoning a known job. When
-// the job is not pending, no lease is taken and the result is nil.
+// that need to simulate a worker leasing and then abandoning a known job. The
+// claim is one atomic UPDATE, so a concurrent worker cannot also take the job.
+// When the job is not pending, no lease is taken and an error is returned.
 func (s *SQLiteStore) LeaseJobByID(id string, leaseDuration time.Duration) (*Job, error) {
 	now := time.Now().UTC()
 	until := now.Add(leaseDuration)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
 
-	row := tx.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
-		 FROM jobs WHERE id = ?`, id)
+	row := s.db.QueryRow(
+		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?
+		 WHERE id = ? AND state = 'pending'
+		 RETURNING id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at`,
+		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), id)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("job %s not found", id)
+		existing, gerr := s.GetJob(id)
+		if gerr == sql.ErrNoRows {
+			return nil, fmt.Errorf("job %s not found", id)
+		}
+		if gerr != nil {
+			return nil, fmt.Errorf("query job: %w", gerr)
+		}
+		return nil, fmt.Errorf("job %s is %s, not pending", id, existing.State)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("query job: %w", err)
+		return nil, fmt.Errorf("claim job: %w", err)
 	}
-	if job.State != StatePending {
-		return nil, fmt.Errorf("job %s is %s, not pending", id, job.State)
-	}
-
-	_, err = tx.Exec(
-		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ? WHERE id = ? AND state = 'pending'`,
-		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), id)
-	if err != nil {
-		return nil, fmt.Errorf("update lease: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit lease: %w", err)
-	}
-
-	job.State = StateLeased
-	job.LeasedUntil = &until
-	job.UpdatedAt = now
 	return &job, nil
 }
 
@@ -368,8 +365,11 @@ func (s *SQLiteStore) RequeueJob(id string, maxAttempts int, payload *string) (J
 // RecoverOrphanedLeases finds jobs whose lease deadline passed and returns
 // them to the pending state. Each recovery consumes one attempt. When no
 // attempt remains, the job enters the dead-letter state instead of looping.
-// The returned slice reports the jobs that were touched, with their updated
-// retry counters, so callers can log a recovery event per job.
+// Every update guards on the leased state and reports only rows that actually
+// changed, so two workers that scan the same orphan concurrently apply the
+// recovery exactly once. The returned slice reports the jobs that were
+// touched, with their updated retry counters, so callers can log a recovery
+// event per job.
 func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 	now := time.Now().UTC()
 	rows, err := s.db.Query(
@@ -393,32 +393,46 @@ func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 		return nil, nil
 	}
 
+	recovered := []Job{}
 	for i := range orphans {
 		j := &orphans[i]
 		nextAttempt := j.RetryCount + 1
+		var (
+			res sql.Result
+			err error
+		)
 		if nextAttempt >= j.MaxAttempts {
-			_, err := s.db.Exec(
+			res, err = s.db.Exec(
 				`UPDATE jobs SET state = 'dead_letter', retry_count = ?, leased_until = NULL, updated_at = ?
 				 WHERE id = ? AND state = 'leased'`,
 				nextAttempt, now.Format(sqliteTimeFormat), j.ID)
 			if err != nil {
 				return nil, fmt.Errorf("dead-letter orphaned job %s: %w", j.ID, err)
 			}
-			j.RetryCount = nextAttempt
 			j.State = StateDeadLetter
+		} else {
+			res, err = s.db.Exec(
+				`UPDATE jobs SET state = 'pending', retry_count = ?, leased_until = NULL, updated_at = ?
+				 WHERE id = ? AND state = 'leased'`,
+				nextAttempt, now.Format(sqliteTimeFormat), j.ID)
+			if err != nil {
+				return nil, fmt.Errorf("recover job %s: %w", j.ID, err)
+			}
+			j.State = StatePending
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("rows affected: %w", err)
+		}
+		if n == 0 {
+			// Another worker recovered this job first. Skip it so its event is
+			// logged only once.
 			continue
 		}
-		_, err := s.db.Exec(
-			`UPDATE jobs SET state = 'pending', retry_count = ?, leased_until = NULL, updated_at = ?
-			 WHERE id = ? AND state = 'leased'`,
-			nextAttempt, now.Format(sqliteTimeFormat), j.ID)
-		if err != nil {
-			return nil, fmt.Errorf("recover job %s: %w", j.ID, err)
-		}
 		j.RetryCount = nextAttempt
-		j.State = StatePending
+		recovered = append(recovered, *j)
 	}
-	return orphans, nil
+	return recovered, nil
 }
 
 // pendingOrderBy builds the ORDER BY clause for ready jobs. When aging is
@@ -450,6 +464,107 @@ func (s *SQLiteStore) GetLeasedJobs() ([]Job, error) {
 
 func (s *SQLiteStore) GetAllJobs() ([]Job, error) {
 	return s.queryJobs(`ORDER BY created_at DESC`)
+}
+
+// JobFilter selects a subset of jobs for listing and inspection tools. Empty
+// fields match every job. Query is a case-insensitive substring match against
+// the job ID, idempotency key, and payload. Limit caps the result; zero means
+// no cap. Offset skips that many matching jobs.
+type JobFilter struct {
+	State  JobState
+	Kind   string
+	Query  string
+	Limit  int
+	Offset int
+}
+
+// SearchJobs returns the jobs that match the filter, newest first. When Limit
+// is positive, at most that many jobs are returned. Inspection tools and the
+// web dashboard use this method to render paginated, filtered views.
+func (s *SQLiteStore) SearchJobs(f JobFilter) ([]Job, error) {
+	where, args := buildJobFilter(f)
+	query := `SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+		 FROM jobs ` + where + ` ORDER BY created_at DESC, id ASC`
+	if f.Limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, f.Limit)
+	}
+	if f.Offset > 0 {
+		query += ` OFFSET ?`
+		args = append(args, f.Offset)
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search jobs: %w", err)
+	}
+	defer rows.Close()
+
+	jobs := []Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan searched job: %w", err)
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
+// CountJobs returns the number of jobs that match the filter. It uses the same
+// State, Kind, and Query fields as SearchJobs, but ignores the pagination
+// fields so callers can report the total across all pages.
+func (s *SQLiteStore) CountJobs(f JobFilter) (int, error) {
+	where, args := buildJobFilter(f)
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM jobs `+where, args...).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count jobs: %w", err)
+	}
+	return count, nil
+}
+
+// GetKinds returns the distinct job kinds stored in the queue, ordered
+// alphabetically. Filter menus in inspection tools use the list for choices.
+func (s *SQLiteStore) GetKinds() ([]string, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT kind FROM jobs ORDER BY kind`)
+	if err != nil {
+		return nil, fmt.Errorf("query kinds: %w", err)
+	}
+	defer rows.Close()
+
+	var kinds []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("scan kind: %w", err)
+		}
+		kinds = append(kinds, k)
+	}
+	return kinds, nil
+}
+
+// buildJobFilter converts a JobFilter into a WHERE clause and its bound
+// arguments. An empty filter yields an empty clause and no arguments, so the
+// caller can append an ORDER BY directly.
+func buildJobFilter(f JobFilter) (string, []any) {
+	var clauses []string
+	var args []any
+	if f.State != "" {
+		clauses = append(clauses, "state = ?")
+		args = append(args, string(f.State))
+	}
+	if f.Kind != "" {
+		clauses = append(clauses, "kind = ?")
+		args = append(args, f.Kind)
+	}
+	if f.Query != "" {
+		clauses = append(clauses, "(id LIKE ? OR idempotency_key LIKE ? OR payload LIKE ?)")
+		pattern := "%" + f.Query + "%"
+		args = append(args, pattern, pattern, pattern)
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
 }
 
 func (s *SQLiteStore) queryJobs(where string, args ...any) ([]Job, error) {
@@ -554,6 +669,105 @@ func (s *SQLiteStore) GetOldestPendingReadyTime() (ready time.Time, ok bool, err
 		return time.Time{}, false, fmt.Errorf("parse oldest pending: %w", err)
 	}
 	return t, true, nil
+}
+
+// GetRetentionStats returns the cumulative retention activity in a fixed source
+// order. Each entry reports how many runs one source performed and how many
+// jobs and events those runs removed. Metrics and the dashboard use the totals
+// to confirm that retention is running and effective.
+func (s *SQLiteStore) GetRetentionStats() ([]RetentionSourceCount, error) {
+	rows, err := s.db.Query(
+		`SELECT source, COUNT(*), COALESCE(SUM(jobs_removed), 0), COALESCE(SUM(events_removed), 0)
+		 FROM retention_runs GROUP BY source ORDER BY source`)
+	if err != nil {
+		return nil, fmt.Errorf("query retention stats: %w", err)
+	}
+	defer rows.Close()
+
+	bySource := map[RetentionSource]RetentionSourceCount{}
+	for rows.Next() {
+		var c RetentionSourceCount
+		var src string
+		if err := rows.Scan(&src, &c.Runs, &c.JobsRemoved, &c.EventsRemoved); err != nil {
+			return nil, fmt.Errorf("scan retention stat: %w", err)
+		}
+		c.Source = RetentionSource(src)
+		bySource[c.Source] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate retention stats: %w", err)
+	}
+
+	stats := make([]RetentionSourceCount, 0, 2)
+	for _, src := range []RetentionSource{RetentionSourceManual, RetentionSourceAuto} {
+		stat, ok := bySource[src]
+		if !ok {
+			stat.Source = src
+		}
+		stats = append(stats, stat)
+	}
+	return stats, nil
+}
+
+// GetLastRetentionRun returns the most recent retention run, or nil when the
+// store has no recorded activity. Metrics use it to report how fresh the last
+// retention pass was.
+func (s *SQLiteStore) GetLastRetentionRun() (*RetentionRun, error) {
+	row := s.db.QueryRow(
+		`SELECT id, started_at, source, max_job_age, max_events_per_job, jobs_removed, events_removed
+		 FROM retention_runs ORDER BY id DESC LIMIT 1`)
+	run, err := scanRetentionRun(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query last retention run: %w", err)
+	}
+	return &run, nil
+}
+
+// RecentRetentionRuns returns the newest retention runs, newest first, up to
+// limit rows. The dashboard shows them as a short activity history.
+func (s *SQLiteStore) RecentRetentionRuns(limit int) ([]RetentionRun, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT id, started_at, source, max_job_age, max_events_per_job, jobs_removed, events_removed
+		 FROM retention_runs ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query recent retention runs: %w", err)
+	}
+	defer rows.Close()
+
+	runs := make([]RetentionRun, 0, limit)
+	for rows.Next() {
+		r, err := scanRetentionRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent retention runs: %w", err)
+	}
+	return runs, nil
+}
+
+func scanRetentionRun(row scannable) (RetentionRun, error) {
+	var r RetentionRun
+	var startedAt, src string
+	err := row.Scan(&r.ID, &startedAt, &src, &r.MaxJobAge, &r.MaxEventsPerJob, &r.JobsRemoved, &r.EventsRemoved)
+	if err != nil {
+		return RetentionRun{}, err
+	}
+	r.Source = RetentionSource(src)
+	t, err := time.Parse(sqliteTimeFormat, startedAt)
+	if err != nil {
+		return RetentionRun{}, fmt.Errorf("parse retention started_at: %w", err)
+	}
+	r.StartedAt = t
+	return r, nil
 }
 
 func (s *SQLiteStore) AppendEvent(e Event) error {

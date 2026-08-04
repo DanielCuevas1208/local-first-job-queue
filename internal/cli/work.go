@@ -28,7 +28,9 @@ func (echoHandler) Handle(ctx context.Context, job queue.Job) error {
 // Work starts a worker process for one job kind. On startup it recovers
 // orphaned leases left by previous workers. A payload may carry a "fault"
 // object; the fault injector honors it so a real worker run can reproduce
-// retries, panics, and crash recovery without extra tooling.
+// retries, panics, and crash recovery without extra tooling. When a retention
+// limit is set, the worker also applies the policy on a schedule, so the store
+// stays small without an external cron job.
 func Work(args []string) error {
 	fs := flag.NewFlagSet("work", flag.ExitOnError)
 	kind := fs.String("kind", "default", "job kind to process")
@@ -39,6 +41,11 @@ func Work(args []string) error {
 	aging := fs.Duration("aging", queue.DefaultAgingInterval, "priority aging interval; a job gains one priority point per interval it waits (0 disables)")
 	metricsAddr := fs.String("metrics-addr", "", "address to serve Prometheus metrics on, e.g. :9090 (empty disables)")
 	webAddr := fs.String("web-addr", "", "address to serve the web dashboard on, e.g. :8080 (empty disables)")
+	webUser := fs.String("web-user", "", "username required by the web dashboard (empty disables auth)")
+	webPass := fs.String("web-pass", "", "password required by the web dashboard (empty disables auth)")
+	retentionAge := fs.Duration("retention-age", 0, "remove terminal jobs last updated before now minus this duration (0 disables automatic retention)")
+	retentionMaxEvents := fs.Int("retention-max-events", 0, "keep only the newest events per surviving job (0 disables automatic retention)")
+	retentionInterval := fs.Duration("retention-interval", time.Hour, "interval between automatic retention runs")
 	fs.Parse(args)
 
 	store, err := queue.NewSQLiteStore(*dbPath, queue.WithAgingInterval(*aging))
@@ -49,11 +56,19 @@ func Work(args []string) error {
 
 	q := queue.NewQueue(store)
 	handler := fault.New(echoHandler{}.Handle, fault.FromPayload).Handle
-	w := worker.NewWorker(q, handler, *kind,
+	opts := []worker.WorkerOption{
 		worker.WithConcurrency(*concurrency),
 		worker.WithLeaseDuration(*leaseDuration),
 		worker.WithPollInterval(*pollInterval),
-	)
+	}
+	retentionEnabled := *retentionAge > 0 || *retentionMaxEvents > 0
+	if retentionEnabled {
+		opts = append(opts, worker.WithRetention(queue.PrunePolicy{
+			MaxJobAge:       *retentionAge,
+			MaxEventsPerJob: *retentionMaxEvents,
+		}, *retentionInterval))
+	}
+	w := worker.NewWorker(q, handler, *kind, opts...)
 
 	var metricsSrv, webSrv *http.Server
 	if *metricsAddr != "" {
@@ -66,7 +81,15 @@ func Work(args []string) error {
 		log.Printf("metrics listening on %s", *metricsAddr)
 	}
 	if *webAddr != "" {
-		webSrv = &http.Server{Addr: *webAddr, Handler: web.Handler(store)}
+		opts := []web.Option{}
+		if *webUser != "" {
+			opts = append(opts, web.WithBasicAuth(*webUser, *webPass))
+		}
+		webServer, err := web.New(store, opts...)
+		if err != nil {
+			return fmt.Errorf("new dashboard: %w", err)
+		}
+		webSrv = &http.Server{Addr: *webAddr, Handler: webServer.Handler()}
 		go func() {
 			if err := webSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				log.Printf("web dashboard: %v", err)
@@ -80,6 +103,10 @@ func Work(args []string) error {
 
 	log.Printf("worker started kind=%q concurrency=%d lease=%s poll=%s aging=%s",
 		*kind, *concurrency, *leaseDuration, *pollInterval, *aging)
+	if retentionEnabled {
+		log.Printf("auto-retention enabled: age=%s max_events=%d interval=%s",
+			*retentionAge, *retentionMaxEvents, *retentionInterval)
+	}
 	err = w.Run(ctx)
 
 	if metricsSrv != nil {
