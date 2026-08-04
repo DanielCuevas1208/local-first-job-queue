@@ -2,7 +2,9 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, crash recovery, priority dispatch, and priority aging.
+
+It also shows a dead-letter queue, Prometheus metrics, a web dashboard, and an append-only event log.
 
 ## Value
 
@@ -21,6 +23,7 @@ The queue separates durable state from worker execution.
 - `internal/fault` injects deterministic errors, panics, delays, and stalls.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
+- `internal/web` serves a read-only HTML dashboard for queue inspection.
 - `internal/fixture` provides repeatable sample workloads.
 
 A job starts as `pending`.
@@ -44,6 +47,7 @@ go build -o jobqueue .
 ./jobqueue enqueue -kind email -payload '{"to":"user@example.com"}' -priority 20
 ./jobqueue work -kind email
 ./jobqueue inspect
+./jobqueue web
 ```
 
 Use `-priority` to place urgent work ahead of normal work.
@@ -89,7 +93,7 @@ jobqueue enqueue -kind <type> -payload <json> [-priority <n>] [-idempotency-key 
 ### `work`
 
 ```text
-jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-metrics-addr <addr>] [-db <path>]
+jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-metrics-addr <addr>] [-web-addr <addr>] [-db <path>]
 ```
 
 The worker recovers expired leases when it starts.
@@ -101,6 +105,26 @@ A job gains one priority point per interval it waits.
 Use `-aging 0` to disable aging.
 
 Use `-metrics-addr` to serve Prometheus metrics beside the worker.
+
+Use `-web-addr` to serve the web dashboard beside the worker.
+
+### `web`
+
+```text
+jobqueue web [-addr <addr>] [-db <path>]
+```
+
+The command serves a read-only HTML dashboard.
+
+Open the dashboard in a browser to inspect queue state.
+
+The dashboard shows state counts, jobs, and recent events.
+
+Each job page shows one job and its full event timeline.
+
+The default address is `:8080`.
+
+Every page reads the store and shows current data.
 
 ### `inspect`
 
@@ -260,6 +284,20 @@ Use the `metrics` command for one snapshot or a live endpoint.
 
 Use `work -metrics-addr` to serve the same endpoint beside a worker.
 
+### Web dashboard
+
+The `web` command serves a read-only HTML dashboard.
+
+The dashboard shows state counts, jobs, and recent events.
+
+Each job page shows one job and its event timeline.
+
+The pages read the store on every request.
+
+The dashboard refreshes every five seconds.
+
+Use `work -web-addr` to serve the dashboard beside a worker.
+
 ### Scheduling
 
 A scheduled job stores its earliest lease time in `run_at`.
@@ -339,6 +377,16 @@ The demo uses generated job IDs and current timestamps.
 
 The final counts depend on the scenario and run deadline.
 
+Serve the web dashboard with this command.
+
+```text
+jobqueue web -db queue.db
+2026/08/04 12:00:00 dashboard listening on :8080 (db=queue.db)
+2026/08/04 12:00:00 open the dashboard at http://localhost:8080
+```
+
+The dashboard shows the same data as `jobqueue inspect`.
+
 ## Verification
 
 Run the full test suite with this command.
@@ -376,7 +424,7 @@ A high-priority stream can delay lower-priority jobs until aging lifts them.
 
 The worker is one process and does not coordinate across hosts.
 
-The project does not provide a web interface.
+The dashboard is read-only and cannot change queue state.
 
 ## Roadmap
 
@@ -386,12 +434,26 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
-- [ ] Web UI for queue inspection.
+- [x] Web UI for queue inspection.
 - [ ] Horizontal scaling with a shared SQLite file.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds a web dashboard for queue inspection.
+
+The new `web` command serves a read-only HTML interface.
+
+The dashboard shows state counts, jobs, and recent events.
+
+Each job page shows one job and its full event timeline.
+
+The pages read the SQLite store on every request.
+
+Use `work -web-addr` to serve the dashboard beside a worker.
+
+The dashboard is read-only; the queue API keeps full control.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 
