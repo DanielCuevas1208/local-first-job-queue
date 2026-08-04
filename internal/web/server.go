@@ -165,12 +165,27 @@ type stateCount struct {
 }
 
 // summary is the JSON and template shape for the queue overview. States use a
-// fixed order so the dashboard renders a stable card row.
+// fixed order so the dashboard renders a stable card row. Retention reports the
+// cumulative retention activity so an operator sees what pruning has done.
 type summary struct {
-	States      []stateCount `json:"states"`
-	Kinds       []string     `json:"kinds"`
-	EventsTotal int          `json:"events_total"`
+	States      []stateCount     `json:"states"`
+	Kinds       []string         `json:"kinds"`
+	EventsTotal int              `json:"events_total"`
+	Retention   retentionSummary `json:"retention"`
 }
+
+// retentionSummary carries the aggregate retention activity and a short history
+// of recent runs for the dashboard.
+type retentionSummary struct {
+	Runs          int                  `json:"runs"`
+	JobsRemoved   int                  `json:"jobs_removed"`
+	EventsRemoved int                  `json:"events_removed"`
+	LastRunAt     *time.Time           `json:"last_run_at,omitempty"`
+	RecentRuns    []queue.RetentionRun `json:"recent_runs"`
+}
+
+// recentRetentionLimit bounds how many retention runs the dashboard lists.
+const recentRetentionLimit = 5
 
 // buildSummary computes the current overview from the store.
 func (s *Server) buildSummary() (summary, error) {
@@ -186,6 +201,14 @@ func (s *Server) buildSummary() (summary, error) {
 	if err != nil {
 		return summary{}, fmt.Errorf("event counts: %w", err)
 	}
+	retStats, err := s.store.GetRetentionStats()
+	if err != nil {
+		return summary{}, fmt.Errorf("retention stats: %w", err)
+	}
+	recent, err := s.store.RecentRetentionRuns(recentRetentionLimit)
+	if err != nil {
+		return summary{}, fmt.Errorf("recent retention runs: %w", err)
+	}
 
 	states := make([]stateCount, 0, len(orderedStates))
 	for _, st := range orderedStates {
@@ -195,7 +218,17 @@ func (s *Server) buildSummary() (summary, error) {
 	for _, ec := range eventCounts {
 		total += ec.Count
 	}
-	return summary{States: states, Kinds: kinds, EventsTotal: total}, nil
+	ret := retentionSummary{RecentRuns: recent}
+	for _, rc := range retStats {
+		ret.Runs += rc.Runs
+		ret.JobsRemoved += rc.JobsRemoved
+		ret.EventsRemoved += rc.EventsRemoved
+	}
+	if len(recent) > 0 {
+		at := recent[0].StartedAt
+		ret.LastRunAt = &at
+	}
+	return summary{States: states, Kinds: kinds, EventsTotal: total, Retention: ret}, nil
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {

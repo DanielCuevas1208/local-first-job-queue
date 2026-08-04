@@ -36,6 +36,14 @@ var eventTypeOrder = []queue.EventType{
 	queue.EventRequeued,
 }
 
+// The canonical retention source order keeps the exposition stable across
+// scrapes. Manual runs come from prune commands; automatic runs come from
+// workers that apply a policy on a schedule.
+var retentionSourceOrder = []queue.RetentionSource{
+	queue.RetentionSourceManual,
+	queue.RetentionSourceAuto,
+}
+
 // Option configures a Collector.
 type Option func(*Collector)
 
@@ -90,7 +98,10 @@ func (c *Collector) Write(w io.Writer) error {
 	if err := c.writeEventCounters(w, evCounts); err != nil {
 		return err
 	}
-	return c.writeOldestPending(w)
+	if err := c.writeOldestPending(w); err != nil {
+		return err
+	}
+	return c.writeRetention(w)
 }
 
 func (c *Collector) writeStateGauge(w io.Writer, stats map[queue.JobState]int) error {
@@ -158,6 +169,62 @@ func (c *Collector) writeOldestPending(w io.Writer) error {
 	}
 	age := c.now().Sub(ready).Seconds()
 	_, err = fmt.Fprintf(w, "jobqueue_oldest_pending_seconds %g\n", age)
+	return err
+}
+
+// writeRetention renders the retention activity families. The run, job, and
+// event counters report cumulative activity per source, so an operator can see
+// whether retention is running automatically or only on demand. The last-run
+// gauge reports how recently a retention pass happened.
+func (c *Collector) writeRetention(w io.Writer) error {
+	stats, err := c.store.GetRetentionStats()
+	if err != nil {
+		return fmt.Errorf("retention stats: %w", err)
+	}
+	bySource := map[queue.RetentionSource]queue.RetentionSourceCount{}
+	for _, s := range stats {
+		bySource[s.Source] = s
+	}
+
+	for _, fam := range []struct {
+		name, help string
+		value      func(queue.RetentionSourceCount) int
+	}{
+		{"jobqueue_retention_runs_total", "Number of retention runs per source.", func(c queue.RetentionSourceCount) int { return c.Runs }},
+		{"jobqueue_retention_jobs_removed_total", "Jobs removed by retention per source.", func(c queue.RetentionSourceCount) int { return c.JobsRemoved }},
+		{"jobqueue_retention_events_removed_total", "Events removed by retention per source.", func(c queue.RetentionSourceCount) int { return c.EventsRemoved }},
+	} {
+		if _, err := fmt.Fprintf(w, "# HELP %s %s\n", fam.name, fam.help); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "# TYPE %s counter\n", fam.name); err != nil {
+			return err
+		}
+		for _, src := range retentionSourceOrder {
+			if _, err := fmt.Fprintf(w, "%s{source=%q} %d\n", fam.name, src, fam.value(bySource[src])); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := fmt.Fprintln(w, "# HELP jobqueue_retention_last_run_seconds Seconds since the most recent retention run."); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "# TYPE jobqueue_retention_last_run_seconds gauge"); err != nil {
+		return err
+	}
+	last, err := c.store.GetLastRetentionRun()
+	if err != nil {
+		return fmt.Errorf("last retention run: %w", err)
+	}
+	if last == nil {
+		return nil
+	}
+	age := c.now().Sub(last.StartedAt).Seconds()
+	if age < 0 {
+		age = 0
+	}
+	_, err = fmt.Fprintf(w, "jobqueue_retention_last_run_seconds %g\n", age)
 	return err
 }
 

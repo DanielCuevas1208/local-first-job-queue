@@ -80,6 +80,15 @@ func migrate(db *sql.DB) error {
 			timestamp TEXT NOT NULL,
 			FOREIGN KEY (job_id) REFERENCES jobs(id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS retention_runs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			started_at TEXT NOT NULL,
+			source TEXT NOT NULL,
+			max_job_age TEXT NOT NULL,
+			max_events_per_job INTEGER NOT NULL,
+			jobs_removed INTEGER NOT NULL,
+			events_removed INTEGER NOT NULL
+		)`,
 		`PRAGMA journal_mode=WAL`,
 		`PRAGMA busy_timeout=5000`,
 		`PRAGMA synchronous=NORMAL`,
@@ -102,6 +111,7 @@ func migrate(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_jobs_kind_priority ON jobs(kind, state, priority DESC, run_at, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_job_id ON events(job_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)`,
+		`CREATE INDEX IF NOT EXISTS idx_retention_runs_source ON retention_runs(source)`,
 	}
 	for _, q := range indexes {
 		if _, err := db.Exec(q); err != nil {
@@ -659,6 +669,105 @@ func (s *SQLiteStore) GetOldestPendingReadyTime() (ready time.Time, ok bool, err
 		return time.Time{}, false, fmt.Errorf("parse oldest pending: %w", err)
 	}
 	return t, true, nil
+}
+
+// GetRetentionStats returns the cumulative retention activity in a fixed source
+// order. Each entry reports how many runs one source performed and how many
+// jobs and events those runs removed. Metrics and the dashboard use the totals
+// to confirm that retention is running and effective.
+func (s *SQLiteStore) GetRetentionStats() ([]RetentionSourceCount, error) {
+	rows, err := s.db.Query(
+		`SELECT source, COUNT(*), COALESCE(SUM(jobs_removed), 0), COALESCE(SUM(events_removed), 0)
+		 FROM retention_runs GROUP BY source ORDER BY source`)
+	if err != nil {
+		return nil, fmt.Errorf("query retention stats: %w", err)
+	}
+	defer rows.Close()
+
+	bySource := map[RetentionSource]RetentionSourceCount{}
+	for rows.Next() {
+		var c RetentionSourceCount
+		var src string
+		if err := rows.Scan(&src, &c.Runs, &c.JobsRemoved, &c.EventsRemoved); err != nil {
+			return nil, fmt.Errorf("scan retention stat: %w", err)
+		}
+		c.Source = RetentionSource(src)
+		bySource[c.Source] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate retention stats: %w", err)
+	}
+
+	stats := make([]RetentionSourceCount, 0, 2)
+	for _, src := range []RetentionSource{RetentionSourceManual, RetentionSourceAuto} {
+		stat, ok := bySource[src]
+		if !ok {
+			stat.Source = src
+		}
+		stats = append(stats, stat)
+	}
+	return stats, nil
+}
+
+// GetLastRetentionRun returns the most recent retention run, or nil when the
+// store has no recorded activity. Metrics use it to report how fresh the last
+// retention pass was.
+func (s *SQLiteStore) GetLastRetentionRun() (*RetentionRun, error) {
+	row := s.db.QueryRow(
+		`SELECT id, started_at, source, max_job_age, max_events_per_job, jobs_removed, events_removed
+		 FROM retention_runs ORDER BY id DESC LIMIT 1`)
+	run, err := scanRetentionRun(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query last retention run: %w", err)
+	}
+	return &run, nil
+}
+
+// RecentRetentionRuns returns the newest retention runs, newest first, up to
+// limit rows. The dashboard shows them as a short activity history.
+func (s *SQLiteStore) RecentRetentionRuns(limit int) ([]RetentionRun, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT id, started_at, source, max_job_age, max_events_per_job, jobs_removed, events_removed
+		 FROM retention_runs ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query recent retention runs: %w", err)
+	}
+	defer rows.Close()
+
+	runs := make([]RetentionRun, 0, limit)
+	for rows.Next() {
+		r, err := scanRetentionRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent retention runs: %w", err)
+	}
+	return runs, nil
+}
+
+func scanRetentionRun(row scannable) (RetentionRun, error) {
+	var r RetentionRun
+	var startedAt, src string
+	err := row.Scan(&r.ID, &startedAt, &src, &r.MaxJobAge, &r.MaxEventsPerJob, &r.JobsRemoved, &r.EventsRemoved)
+	if err != nil {
+		return RetentionRun{}, err
+	}
+	r.Source = RetentionSource(src)
+	t, err := time.Parse(sqliteTimeFormat, startedAt)
+	if err != nil {
+		return RetentionRun{}, fmt.Errorf("parse retention started_at: %w", err)
+	}
+	r.StartedAt = t
+	return r, nil
 }
 
 func (s *SQLiteStore) AppendEvent(e Event) error {

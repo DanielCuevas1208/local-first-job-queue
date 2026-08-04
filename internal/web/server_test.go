@@ -99,6 +99,48 @@ func TestAPISummary(t *testing.T) {
 	}
 }
 
+// TestAPISummaryIncludesRetentionActivity verifies that the dashboard summary
+// exposes source totals and the newest runs after manual and automatic passes.
+func TestAPISummaryIncludesRetentionActivity(t *testing.T) {
+	srv, _, q := newServer(t)
+	job, err := q.Enqueue("retention", `{}`)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	leased, err := q.Lease(context.Background(), "retention", time.Minute)
+	if err != nil || leased == nil || leased.ID != job.ID {
+		t.Fatalf("lease: %v %v", leased, err)
+	}
+	if err := q.Acknowledge(job.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if _, err := q.Prune(queue.PrunePolicy{MaxEventsPerJob: 1}); err != nil {
+		t.Fatalf("manual prune: %v", err)
+	}
+	if _, err := q.PruneAuto(queue.PrunePolicy{MaxEventsPerJob: 1}); err != nil {
+		t.Fatalf("automatic prune: %v", err)
+	}
+
+	rec := get(t, srv.Handler(), "/api/summary")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var sum summary
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatalf("decode summary: %v", err)
+	}
+	if sum.Retention.Runs != 2 || sum.Retention.JobsRemoved != 0 || sum.Retention.EventsRemoved != 2 {
+		t.Errorf("unexpected retention totals: %+v", sum.Retention)
+	}
+	if len(sum.Retention.RecentRuns) != 2 {
+		t.Fatalf("expected two recent runs, got %+v", sum.Retention.RecentRuns)
+	}
+	if sum.Retention.RecentRuns[0].Source != queue.RetentionSourceAuto ||
+		sum.Retention.RecentRuns[1].Source != queue.RetentionSourceManual {
+		t.Errorf("expected newest runs first by source, got %+v", sum.Retention.RecentRuns)
+	}
+}
+
 // TestAPIJobsFilters verifies that the jobs endpoint honors state and query
 // filters and reports the total match count.
 func TestAPIJobsFilters(t *testing.T) {

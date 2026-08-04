@@ -323,13 +323,25 @@ func (q *Queue) Requeue(jobID string, opts ...RequeueOption) (*Job, error) {
 	return &updated, nil
 }
 
-// Prune applies a retention policy to the queue. The policy removes old
-// terminal jobs with their events and caps the event log of every surviving
-// job. A zero-value policy removes nothing and reports zero.
+// Prune applies a retention policy to the queue and records the run as a manual
+// retention action. The policy removes old terminal jobs with their events and
+// caps the event log of every surviving job. A zero-value policy removes
+// nothing and reports zero.
 func (q *Queue) Prune(policy PrunePolicy) (PruneResult, error) {
 	res, err := q.store.Prune(policy)
 	if err != nil {
 		return PruneResult{}, fmt.Errorf("prune: %w", err)
+	}
+	return res, nil
+}
+
+// PruneAuto applies a retention policy and records the run as an automatic
+// retention action. Workers use it for scheduled auto-retention so the activity
+// log distinguishes their runs from manual prune commands.
+func (q *Queue) PruneAuto(policy PrunePolicy) (PruneResult, error) {
+	res, err := q.store.PruneWithSource(policy, RetentionSourceAuto)
+	if err != nil {
+		return PruneResult{}, fmt.Errorf("prune auto: %w", err)
 	}
 	return res, nil
 }

@@ -65,6 +65,19 @@ a:hover { text-decoration: underline; }
   margin-bottom: 1.25rem;
 }
 
+.cards-compact .card-value {
+  font-size: 18px;
+}
+
+.card-value-small {
+  font-size: 14px;
+  word-break: break-all;
+}
+
+.retention-runs {
+  margin-top: 1.5rem;
+}
+
 .card {
   background: var(--bg-panel);
   border: 1px solid var(--border);

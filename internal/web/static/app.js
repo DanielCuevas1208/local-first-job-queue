@@ -80,7 +80,7 @@
 
   function appendText(tr, text) {
     var td = document.createElement("td");
-    td.textContent = text || "";
+    td.textContent = text === undefined || text === null ? "" : String(text);
     tr.appendChild(td);
     return td;
   }
@@ -96,6 +96,40 @@
       var card = document.querySelector('.card-value[data-state="' + sc.state + '"]');
       if (card) card.textContent = sc.count;
     });
+    renderRetention(summary.retention);
+  }
+
+  function renderRetention(retention) {
+    retention = retention || {};
+    var fields = { "runs": retention.runs, "jobs": retention.jobs_removed, "events": retention.events_removed };
+    Object.keys(fields).forEach(function (key) {
+      var card = document.querySelector('.card-value[data-retention="' + key + '"]');
+      if (card) card.textContent = fields[key];
+    });
+    var lastRun = document.querySelector('.card-value[data-retention="last-run"]');
+    if (lastRun) lastRun.textContent = retention.last_run_at ? fmtUTC(retention.last_run_at) : "none";
+
+    var body = document.getElementById("retention-body");
+    var empty = document.getElementById("retention-empty");
+    if (!body) return;
+    body.textContent = "";
+    (retention.recent_runs || []).forEach(function (run) {
+      var tr = document.createElement("tr");
+      appendText(tr, fmtUTC(run.started_at));
+      appendText(tr, run.source);
+      appendNum(tr, run.jobs_removed);
+      appendNum(tr, run.events_removed);
+      appendText(tr, policy(run));
+      body.appendChild(tr);
+    });
+    if (empty) empty.classList.toggle("hidden", (retention.recent_runs || []).length > 0);
+  }
+
+  function policy(run) {
+    var parts = [];
+    if (run.max_job_age && run.max_job_age !== "0s") parts.push("age=" + run.max_job_age);
+    if (run.max_events_per_job > 0) parts.push("events=" + run.max_events_per_job);
+    return parts.join(", ") || "none";
   }
 
   function fetchJSON(url) {

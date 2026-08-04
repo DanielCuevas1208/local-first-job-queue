@@ -330,7 +330,12 @@ func showRetention(kind string) error {
 	completed, totalEvents = retentionCounts(store)
 	fmt.Printf("  prune removed %d job(s) and %d event(s)\n", res.JobsRemoved, res.EventsRemoved)
 	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
-	fmt.Println("old terminal jobs left with their events; the log stays bounded.")
+	activity, err := retentionActivity(store, queue.RetentionSourceManual)
+	if err != nil {
+		return fmt.Errorf("read manual retention activity: %w", err)
+	}
+	fmt.Printf("  activity: source=%s runs=%d jobs_removed=%d events_removed=%d\n", activity.Source, activity.Runs, activity.JobsRemoved, activity.EventsRemoved)
+	fmt.Println("the fresh job kept its events; old terminal jobs left with theirs.")
 	return nil
 }
 
@@ -401,6 +406,11 @@ func showAutoRetention(kind string) error {
 	<-done
 
 	fmt.Printf("  worker removed the old jobs: completed: %d  events: %d\n", completed, totalEvents)
+	activity, err := retentionActivity(store, queue.RetentionSourceAuto)
+	if err != nil {
+		return fmt.Errorf("read automatic retention activity: %w", err)
+	}
+	fmt.Printf("  activity: source=%s runs=%d jobs_removed=%d events_removed=%d\n", activity.Source, activity.Runs, activity.JobsRemoved, activity.EventsRemoved)
 	fmt.Println("the worker keeps the store small while it processes work.")
 	return nil
 }
@@ -417,6 +427,21 @@ func retentionCounts(store *queue.SQLiteStore) (completed, events int) {
 		}
 	}
 	return completed, events
+}
+
+// retentionActivity returns the aggregate for one retention source. The demo
+// uses it to show that every manual and automatic pass is observable.
+func retentionActivity(store *queue.SQLiteStore, source queue.RetentionSource) (queue.RetentionSourceCount, error) {
+	stats, err := store.GetRetentionStats()
+	if err != nil {
+		return queue.RetentionSourceCount{}, err
+	}
+	for _, stat := range stats {
+		if stat.Source == source {
+			return stat, nil
+		}
+	}
+	return queue.RetentionSourceCount{Source: source}, nil
 }
 
 func shortID(id string) string {

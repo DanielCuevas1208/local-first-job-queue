@@ -13,6 +13,25 @@
     </div>
   </section>
 
+  <section class="cards cards-compact">
+    <div class="card">
+      <div class="card-label">retention runs</div>
+      <div class="card-value" data-retention="runs">{{.Summary.Retention.Runs}}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">jobs removed</div>
+      <div class="card-value" data-retention="jobs">{{.Summary.Retention.JobsRemoved}}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">events removed</div>
+      <div class="card-value" data-retention="events">{{.Summary.Retention.EventsRemoved}}</div>
+    </div>
+    <div class="card">
+      <div class="card-label">last retention run</div>
+      <div class="card-value card-value-small" data-retention="last-run">{{if .Summary.Retention.LastRunAt}}{{.Summary.Retention.LastRunAt | fmtTime}}{{else}}none{{end}}</div>
+    </div>
+  </section>
+
   <section class="filters">
     <label class="field">
       <span>State</span>
@@ -69,6 +88,27 @@
       </table>
     </div>
     <p id="jobs-empty" class="empty hidden">No jobs match the current filters.</p>
+  </section>
+
+  <section class="retention-runs">
+    <div class="jobs-head">
+      <h1>Recent retention runs</h1>
+    </div>
+    <div class="table-scroll">
+      <table class="jobs-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Source</th>
+            <th class="num">Jobs removed</th>
+            <th class="num">Events removed</th>
+            <th>Policy</th>
+          </tr>
+        </thead>
+        <tbody id="retention-body"></tbody>
+      </table>
+    </div>
+    <p id="retention-empty" class="empty hidden">No retention runs recorded.</p>
   </section>
 
   <p id="last-updated" class="muted"></p>

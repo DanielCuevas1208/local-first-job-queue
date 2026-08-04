@@ -198,10 +198,12 @@ func (w *Worker) retentionLoop(ctx context.Context) {
 	}
 }
 
-// runRetention performs one prune pass and reports what it removed. Errors are
-// logged and skipped, so a transient store failure does not stop the worker.
+// runRetention performs one prune pass and reports what it removed. The run is
+// recorded as automatic retention, so metrics and the dashboard show it beside
+// manual prune commands. Errors are logged and skipped, so a transient store
+// failure does not stop the worker.
 func (w *Worker) runRetention() {
-	res, err := w.queue.Prune(w.retention.policy)
+	res, err := w.queue.PruneAuto(w.retention.policy)
 	if err != nil {
 		log.Printf("auto-retention: %v", err)
 		return

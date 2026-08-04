@@ -27,15 +27,29 @@ type PruneResult struct {
 	EventsRemoved int `json:"events_removed"`
 }
 
-// Prune applies a retention policy in one transaction. The age limit removes
-// terminal jobs and their events, and the per-job event cap trims the log of
-// the jobs that remain. The transaction keeps the two deletes consistent, so a
-// job can never lose its events while it survives. A concurrent writer is
-// excluded until the run commits, matching the single-writer lease model.
+// Prune applies a retention policy in one transaction and records the run as a
+// manual retention action. The age limit removes terminal jobs and their
+// events, and the per-job event cap trims the log of the jobs that remain. The
+// transaction keeps the two deletes consistent, so a job can never lose its
+// events while it survives. A concurrent writer is excluded until the run
+// commits, matching the single-writer lease model.
 func (s *SQLiteStore) Prune(p PrunePolicy) (PruneResult, error) {
+	return s.PruneWithSource(p, RetentionSourceManual)
+}
+
+// PruneWithSource applies a retention policy and records the run under the
+// supplied source. Manual runs come from the prune command or a direct Prune
+// call. Automatic runs come from a worker that applies the policy on a
+// schedule. The recorded log lets metrics and the dashboard report retention
+// activity without a separate collector.
+func (s *SQLiteStore) PruneWithSource(p PrunePolicy, source RetentionSource) (PruneResult, error) {
 	if p.MaxJobAge <= 0 && p.MaxEventsPerJob <= 0 {
 		return PruneResult{}, nil
 	}
+	if source != RetentionSourceManual && source != RetentionSourceAuto {
+		return PruneResult{}, fmt.Errorf("unknown retention source %q", source)
+	}
+	startedAt := time.Now().UTC()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return PruneResult{}, fmt.Errorf("begin prune: %w", err)
@@ -44,7 +58,7 @@ func (s *SQLiteStore) Prune(p PrunePolicy) (PruneResult, error) {
 
 	res := PruneResult{}
 	if p.MaxJobAge > 0 {
-		cutoff := time.Now().UTC().Add(-p.MaxJobAge).Format(sqliteTimeFormat)
+		cutoff := startedAt.Add(-p.MaxJobAge).Format(sqliteTimeFormat)
 		events, err := tx.Exec(
 			`DELETE FROM events WHERE job_id IN (
 				SELECT id FROM jobs
@@ -91,6 +105,14 @@ func (s *SQLiteStore) Prune(p PrunePolicy) (PruneResult, error) {
 			return PruneResult{}, fmt.Errorf("count trimmed events: %w", err)
 		}
 		res.EventsRemoved += int(n)
+	}
+
+	if _, err := tx.Exec(
+		`INSERT INTO retention_runs (started_at, source, max_job_age, max_events_per_job, jobs_removed, events_removed)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		startedAt.Format(sqliteTimeFormat), string(source),
+		p.MaxJobAge.String(), p.MaxEventsPerJob, res.JobsRemoved, res.EventsRemoved); err != nil {
+		return PruneResult{}, fmt.Errorf("record retention run: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {

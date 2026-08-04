@@ -391,7 +391,7 @@ The exporter renders queue state in the Prometheus text format.
 
 Each scrape computes a fresh snapshot from the SQLite store.
 
-The exporter reports four metric families.
+The exporter reports eight metric families.
 
 `jobqueue_jobs` counts jobs by state.
 
@@ -400,6 +400,16 @@ The exporter reports four metric families.
 `jobqueue_events_total` counts events by type.
 
 `jobqueue_oldest_pending_seconds` reports the oldest pending job's age.
+
+`jobqueue_retention_runs_total` counts retention runs by source.
+
+`jobqueue_retention_jobs_removed_total` counts removed jobs by source.
+
+`jobqueue_retention_events_removed_total` counts removed events by source.
+
+`jobqueue_retention_last_run_seconds` reports the age of the latest run.
+
+The last-run gauge is absent until the first retention run.
 
 Every known state and event type appears with an explicit zero.
 
@@ -417,6 +427,8 @@ The dashboard reads the same SQLite store as every other command.
 
 It shows one count card per state, plus a total event count.
 
+It shows retention totals and five recent retention runs.
+
 State, kind, and search filters narrow the job table.
 
 The search field matches job IDs, idempotency keys, and payloads.
@@ -429,7 +441,7 @@ The server embeds all templates and static files in the binary.
 
 The JSON API supports scripts and other inspection tools.
 
-`GET /api/summary` reports state counts, kinds, and the event total.
+`GET /api/summary` reports queue counts, event totals, and retention activity.
 
 `GET /api/jobs` lists matching jobs with pagination fields.
 
@@ -493,7 +505,9 @@ A run with both limits applies them together.
 
 The transaction keeps the job and event deletes consistent.
 
-A zero-value policy removes nothing.
+A zero-value policy removes nothing and records no run.
+
+Each non-empty run records its source, policy, and removal counts.
 
 Retention is idempotent; a second run finds nothing to delete.
 
@@ -520,6 +534,20 @@ Several workers with the same policy stay safe on one file.
 Set at least one limit, or automatic retention stays off.
 
 The demo shows a worker removing old jobs by itself.
+
+### Retention activity
+
+The `prune` command records source `manual`.
+
+The worker records source `auto`.
+
+Metrics expose cumulative counters for each source.
+
+The dashboard shows totals and five newest runs.
+
+SQLite stores the activity, so it remains visible after a restart.
+
+The demo prints activity for both retention sources.
 
 ## Sample output
 
@@ -563,14 +591,16 @@ Retention
 retention age: 1h0m0s; terminal jobs older than that leave with their events.
   completed: 3  events: 9
   prune removed 2 job(s) and 6 event(s)
+  activity: source=manual runs=1 jobs_removed=2 events_removed=6
   completed: 1  events: 3
-old terminal jobs left with their events; the log stays bounded.
+the fresh job kept its events; old terminal jobs left with theirs.
 
 Auto-retention
 --------------
 a worker with age=1h0m0s prunes every 50ms; no external job is needed.
   completed: 3  events: 9
   worker removed the old jobs: completed: 1  events: 3
+  activity: source=auto runs=<n> jobs_removed=2 events_removed=6
 the worker keeps the store small while it processes work.
 
 Queue state
@@ -601,7 +631,25 @@ jobqueue_events_total{type="enqueued"} 5
 jobqueue_events_total{type="retried"} 5
 jobqueue_events_total{type="dead_lettered"} 1
 jobqueue_events_total{type="requeued"} 1
+# HELP jobqueue_retention_runs_total Number of retention runs per source.
+# TYPE jobqueue_retention_runs_total counter
+jobqueue_retention_runs_total{source="manual"} 0
+jobqueue_retention_runs_total{source="auto"} 0
+# HELP jobqueue_retention_jobs_removed_total Jobs removed by retention per source.
+# TYPE jobqueue_retention_jobs_removed_total counter
+jobqueue_retention_jobs_removed_total{source="manual"} 0
+jobqueue_retention_jobs_removed_total{source="auto"} 0
+# HELP jobqueue_retention_events_removed_total Events removed by retention per source.
+# TYPE jobqueue_retention_events_removed_total counter
+jobqueue_retention_events_removed_total{source="manual"} 0
+jobqueue_retention_events_removed_total{source="auto"} 0
+# HELP jobqueue_retention_last_run_seconds Seconds since the most recent retention run.
+# TYPE jobqueue_retention_last_run_seconds gauge
 ```
+
+The final metrics snapshot uses the main demo store.
+
+The retention examples use separate stores, so their counters stay separate.
 
 Point a browser at the dashboard to inspect the same store.
 
@@ -734,11 +782,25 @@ Add a reverse proxy with HTTPS for any shared deployment.
 - [x] Authenticated dashboard access for shared deployments.
 - [x] Job retention policies and event log cleanup.
 - [x] Scheduled auto-retention from the worker process.
-- [ ] Report retention activity in metrics and the dashboard.
+- [x] Report retention activity in metrics and the dashboard.
 
 ### Release notes
 
-This release adds scheduled auto-retention from the worker process.
+This release adds retention activity reporting.
+
+Each non-empty retention run records its source, policy, and removal counts.
+
+The `prune` command records manual runs.
+
+The worker records automatic runs.
+
+Metrics expose counters by source and the latest run age.
+
+The dashboard shows totals and five recent runs.
+
+The demo prints activity for both sources.
+
+The previous slice added scheduled auto-retention from the worker process.
 
 A worker with `-retention-age` or `-retention-max-events` prunes on a schedule.
 

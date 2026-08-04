@@ -378,6 +378,64 @@ func TestPruneConcurrentWithLease(t *testing.T) {
 	}
 }
 
+// TestPruneRecordsRetentionActivity verifies that manual and automatic runs
+// persist source labels, cumulative counts, policy details, and run order.
+func TestPruneRecordsRetentionActivity(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+	completeOne(t, q)
+
+	manual, err := q.Prune(PrunePolicy{MaxEventsPerJob: 1})
+	if err != nil {
+		t.Fatalf("manual prune: %v", err)
+	}
+	if manual.EventsRemoved != 2 {
+		t.Fatalf("expected manual run to remove 2 events, got %+v", manual)
+	}
+	auto, err := q.PruneAuto(PrunePolicy{MaxEventsPerJob: 1})
+	if err != nil {
+		t.Fatalf("automatic prune: %v", err)
+	}
+	if auto.EventsRemoved != 0 {
+		t.Fatalf("expected automatic run to find no events, got %+v", auto)
+	}
+
+	stats, err := s.GetRetentionStats()
+	if err != nil {
+		t.Fatalf("retention stats: %v", err)
+	}
+	want := []RetentionSourceCount{
+		{Source: RetentionSourceManual, Runs: 1, EventsRemoved: 2},
+		{Source: RetentionSourceAuto, Runs: 1},
+	}
+	if len(stats) != len(want) {
+		t.Fatalf("expected %d source stats, got %+v", len(want), stats)
+	}
+	for i := range want {
+		if stats[i] != want[i] {
+			t.Errorf("source stat %d: expected %+v, got %+v", i, want[i], stats[i])
+		}
+	}
+
+	recent, err := s.RecentRetentionRuns(1)
+	if err != nil {
+		t.Fatalf("recent runs: %v", err)
+	}
+	if len(recent) != 1 || recent[0].Source != RetentionSourceAuto {
+		t.Fatalf("expected newest automatic run, got %+v", recent)
+	}
+	if recent[0].MaxEventsPerJob != 1 || recent[0].MaxJobAge != "0s" {
+		t.Errorf("expected recorded policy, got %+v", recent[0])
+	}
+	last, err := s.GetLastRetentionRun()
+	if err != nil {
+		t.Fatalf("last run: %v", err)
+	}
+	if last == nil || last.ID != recent[0].ID {
+		t.Fatalf("expected last run %v, got %+v", recent, last)
+	}
+}
+
 func nowStamp() string {
 	return time.Now().UTC().Format(sqliteTimeFormat)
 }
