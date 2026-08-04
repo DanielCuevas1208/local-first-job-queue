@@ -355,3 +355,159 @@ func TestRecoveryEventSequence(t *testing.T) {
 		}
 	}
 }
+
+// completeJob leases a specific job and acknowledges it, so the job reaches the
+// completed state with a full event timeline. The lease-by-ID claim is atomic,
+// so the helper stays deterministic.
+func completeJob(t *testing.T, q *queue.Queue, s *queue.SQLiteStore, id string) {
+	t.Helper()
+	if _, err := s.LeaseJobByID(id, time.Minute); err != nil {
+		t.Fatalf("lease %s: %v", id, err)
+	}
+	if err := q.Acknowledge(id); err != nil {
+		t.Fatalf("ack %s: %v", id, err)
+	}
+}
+
+// ageJob sets a job's last-update time to an explicit value. Auto-retention
+// tests use it to decide which jobs the age limit removes without waiting on a
+// wall clock.
+func ageJob(t *testing.T, s *queue.SQLiteStore, id string, at time.Time) {
+	t.Helper()
+	if _, err := s.DB().Exec(
+		`UPDATE jobs SET updated_at = ? WHERE id = ?`,
+		at.UTC().Format(time.RFC3339Nano), id); err != nil {
+		t.Fatalf("age job %s: %v", id, err)
+	}
+}
+
+// TestWorkerAutoRetentionRemovesOldJobs verifies that a worker with a retention
+// policy cleans old terminal jobs on its own schedule. No external prune run is
+// needed; the worker applies the policy at startup and keeps the store small.
+func TestWorkerAutoRetentionRemovesOldJobs(t *testing.T) {
+	q, s := newTestQueue(t)
+
+	var keep *queue.Job
+	for i := 0; i < 3; i++ {
+		job, err := q.Enqueue("test", `{}`)
+		if err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+		completeJob(t, q, s, job.ID)
+		if i < 2 {
+			ageJob(t, s, job.ID, time.Now().UTC().Add(-48*time.Hour))
+		} else {
+			keep = job
+		}
+	}
+
+	w := NewWorker(q, func(ctx context.Context, job queue.Job) error { return nil }, "test",
+		WithPollInterval(10*time.Millisecond),
+		WithLeaseDuration(time.Minute),
+		WithRetention(queue.PrunePolicy{MaxJobAge: time.Hour}, 50*time.Millisecond),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = w.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitFor(t, func() bool {
+		snap, _ := q.Inspect()
+		return snap.Stats[queue.StateCompleted] == 1
+	}, 2*time.Second)
+
+	if _, err := s.GetJob(keep.ID); err != nil {
+		t.Errorf("expected the fresh job to survive auto-retention: %v", err)
+	}
+	events, err := s.GetAllEvents()
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	if len(events) != 2 {
+		t.Errorf("expected 2 events to remain for the fresh job, got %d", len(events))
+	}
+}
+
+// TestWorkerAutoRetentionRunsBesideJobs verifies that the retention loop does
+// not disturb the job loop. A fresh pending job is processed normally while an
+// old terminal job leaves the store on the retention schedule.
+func TestWorkerAutoRetentionRunsBesideJobs(t *testing.T) {
+	q, s := newTestQueue(t)
+
+	oldJob, err := q.Enqueue("test", `{"n":"old"}`)
+	if err != nil {
+		t.Fatalf("enqueue old: %v", err)
+	}
+	completeJob(t, q, s, oldJob.ID)
+	ageJob(t, s, oldJob.ID, time.Now().UTC().Add(-48*time.Hour))
+
+	var processed atomic.Int32
+	w := NewWorker(q, func(ctx context.Context, job queue.Job) error {
+		processed.Add(1)
+		return nil
+	}, "test",
+		WithPollInterval(10*time.Millisecond),
+		WithLeaseDuration(time.Minute),
+		WithRetention(queue.PrunePolicy{MaxJobAge: time.Hour}, 50*time.Millisecond),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = w.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	if _, err := q.Enqueue("test", `{"n":"fresh"}`); err != nil {
+		t.Fatalf("enqueue fresh: %v", err)
+	}
+
+	waitFor(t, func() bool {
+		return processed.Load() == 1
+	}, 2*time.Second)
+	waitFor(t, func() bool {
+		_, err := s.GetJob(oldJob.ID)
+		return err != nil
+	}, 2*time.Second)
+
+	snap, _ := q.Inspect()
+	if snap.Stats[queue.StateCompleted] != 1 {
+		t.Errorf("expected 1 completed job to remain, got %d", snap.Stats[queue.StateCompleted])
+	}
+}
+
+// TestWorkerRetentionOffByDefault verifies that a worker without a retention
+// option never removes old jobs. Auto-retention stays opt-in, so a worker
+// never changes data beyond the jobs it leases.
+func TestWorkerRetentionOffByDefault(t *testing.T) {
+	q, s := newTestQueue(t)
+
+	job, err := q.Enqueue("test", `{}`)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	completeJob(t, q, s, job.ID)
+	ageJob(t, s, job.ID, time.Now().UTC().Add(-48*time.Hour))
+
+	w := NewWorker(q, func(ctx context.Context, job queue.Job) error { return nil }, "test",
+		WithPollInterval(10*time.Millisecond),
+		WithLeaseDuration(time.Minute),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	go w.Run(ctx)
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	if _, err := s.GetJob(job.ID); err != nil {
+		t.Errorf("expected the old job to stay when auto-retention is off: %v", err)
+	}
+}

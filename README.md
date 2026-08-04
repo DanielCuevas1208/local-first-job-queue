@@ -10,6 +10,8 @@ It provides Prometheus metrics and an append-only event log.
 
 A retention policy removes old terminal jobs and trims the log.
 
+A worker can apply that policy on a schedule without an external cron job.
+
 It includes a browser dashboard and shared-file horizontal scaling.
 
 The dashboard can require HTTP Basic credentials for shared deployments.
@@ -27,7 +29,7 @@ The demo injects repeatable faults, so failure paths are easy to inspect.
 The queue separates durable state from worker execution.
 
 - `internal/queue` owns the public queue API and SQLite store.
-- `internal/worker` leases jobs and runs handlers.
+- `internal/worker` leases jobs, runs handlers, and applies scheduled retention.
 - `internal/fault` injects deterministic errors, panics, delays, and stalls.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
@@ -91,6 +93,14 @@ Run a worker with a browser dashboard on the same database.
 
 Open the printed address in a browser.
 
+Keep the store small while a worker runs with this command.
+
+```text
+./jobqueue work -kind email -retention-age 168h -retention-max-events 1000 &
+```
+
+The worker removes old terminal jobs every hour.
+
 Run several workers on one database file.
 
 ```text
@@ -138,7 +148,7 @@ jobqueue enqueue -kind <type> -payload <json> [-priority <n>] [-idempotency-key 
 ### `work`
 
 ```text
-jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-metrics-addr <addr>] [-web-addr <addr>] [-web-user <name>] [-web-pass <password>] [-db <path>]
+jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-retention-age <duration>] [-retention-max-events <n>] [-retention-interval <duration>] [-metrics-addr <addr>] [-web-addr <addr>] [-web-user <name>] [-web-pass <password>] [-db <path>]
 ```
 
 The worker recovers expired leases when it starts.
@@ -148,6 +158,16 @@ Priority aging is enabled by default with a 30-second interval.
 A job gains one priority point per interval it waits.
 
 Use `-aging 0` to disable aging.
+
+Use `-retention-age` or `-retention-max-events` to enable automatic retention.
+
+The worker applies the policy once at startup, then on every interval.
+
+Set at least one limit, or automatic retention stays off.
+
+The default interval is one hour.
+
+Use `-retention-interval` to change the cadence.
 
 Use `-metrics-addr` to serve Prometheus metrics beside the worker.
 
@@ -243,7 +263,7 @@ Use `-once` to print one snapshot and exit.
 jobqueue demo [-db <path>] [-keep] [-run <duration>] [-kind <type>]
 ```
 
-The demo combines priority, retries, panic recovery, crash recovery, scheduling, priority aging, dead-letter requeue, and retention.
+The demo combines priority, retries, panic recovery, crash recovery, scheduling, priority aging, dead-letter requeue, retention, and scheduled auto-retention.
 
 ### `web`
 
@@ -479,6 +499,28 @@ Retention is idempotent; a second run finds nothing to delete.
 
 The demo shows a completed queue dropping to one job and three events.
 
+### Scheduled auto-retention
+
+A worker can apply a retention policy on a schedule.
+
+Set `-retention-age` or `-retention-max-events` on the `work` command.
+
+The worker prunes once at startup, then on every interval.
+
+The default interval is one hour.
+
+Use `-retention-interval` to change the cadence.
+
+The store stays small without an external cron job.
+
+The prune pass is transactional and idempotent.
+
+Several workers with the same policy stay safe on one file.
+
+Set at least one limit, or automatic retention stays off.
+
+The demo shows a worker removing old jobs by itself.
+
 ## Sample output
 
 Run `jobqueue demo` to see a complete local scenario.
@@ -523,6 +565,13 @@ retention age: 1h0m0s; terminal jobs older than that leave with their events.
   prune removed 2 job(s) and 6 event(s)
   completed: 1  events: 3
 old terminal jobs left with their events; the log stays bounded.
+
+Auto-retention
+--------------
+a worker with age=1h0m0s prunes every 50ms; no external job is needed.
+  completed: 3  events: 9
+  worker removed the old jobs: completed: 1  events: 3
+the worker keeps the store small while it processes work.
 
 Queue state
 -----------
@@ -646,6 +695,8 @@ The shared-file tests cover multi-process leases, recovery, and worker scaling.
 
 The retention tests cover the age limit, the event cap, and idempotent runs.
 
+The worker tests cover scheduled auto-retention beside normal processing.
+
 ## Limitations
 
 SQLite serializes writes through one store connection.
@@ -656,7 +707,9 @@ Jobs and events remain until an operator removes them.
 
 The `prune` command removes terminal jobs and old events.
 
-No scheduled auto-prune runs from the worker yet.
+Auto-retention runs only while a worker with limits is running.
+
+Stop every worker, and old terminal jobs stay until the next prune.
 
 A high-priority stream can delay lower-priority jobs until aging lifts them.
 
@@ -680,11 +733,32 @@ Add a reverse proxy with HTTPS for any shared deployment.
 - [x] Horizontal scaling with a shared SQLite file.
 - [x] Authenticated dashboard access for shared deployments.
 - [x] Job retention policies and event log cleanup.
-- [ ] Scheduled auto-retention from the worker process.
+- [x] Scheduled auto-retention from the worker process.
+- [ ] Report retention activity in metrics and the dashboard.
 
 ### Release notes
 
-This release adds job retention policies and event log cleanup.
+This release adds scheduled auto-retention from the worker process.
+
+A worker with `-retention-age` or `-retention-max-events` prunes on a schedule.
+
+The worker applies the policy once at startup, then on every interval.
+
+Use `-retention-interval` to set the cadence; the default is one hour.
+
+The store stays small without an external cron job.
+
+Auto-retention is opt-in; a worker without limits changes nothing.
+
+The prune pass is transactional and idempotent.
+
+Several workers with the same policy stay safe on one shared file.
+
+New tests cover the retention loop, jobs running beside it, and the default.
+
+The demo now shows a worker removing old jobs by itself.
+
+The previous release added job retention policies and event log cleanup.
 
 The new `prune` command applies a retention policy to the queue.
 

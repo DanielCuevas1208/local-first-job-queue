@@ -193,6 +193,9 @@ func Demo(args []string) error {
 	if err := showRetention(*kind); err != nil {
 		return err
 	}
+	if err := showAutoRetention(*kind); err != nil {
+		return err
+	}
 
 	fmt.Println()
 	snap, err = q.Inspect()
@@ -328,6 +331,77 @@ func showRetention(kind string) error {
 	fmt.Printf("  prune removed %d job(s) and %d event(s)\n", res.JobsRemoved, res.EventsRemoved)
 	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
 	fmt.Println("old terminal jobs left with their events; the log stays bounded.")
+	return nil
+}
+
+// showAutoRetention demonstrates that a worker applies a retention policy on a
+// schedule, with no external prune run. Two completed jobs are backdated beyond
+// the retention age. A worker with a short interval removes them by itself
+// while it keeps running.
+func showAutoRetention(kind string) error {
+	const maxAge = time.Hour
+	const interval = 50 * time.Millisecond
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-auto-retention?mode=memory&cache=shared")
+	if err != nil {
+		return fmt.Errorf("open auto-retention store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+	ctx := context.Background()
+
+	fmt.Println("\nAuto-retention")
+	fmt.Println("-------------")
+	fmt.Printf("a worker with age=%s prunes every %s; no external job is needed.\n", maxAge, interval)
+
+	oldIDs := []string{}
+	for i := 0; i < 3; i++ {
+		job, err := q.Enqueue(kind, fmt.Sprintf(`{"name":"auto-%d"}`, i+1))
+		if err != nil {
+			return fmt.Errorf("enqueue auto-retention: %w", err)
+		}
+		leased, err := q.Lease(ctx, kind, time.Minute)
+		if err != nil || leased == nil || leased.ID != job.ID {
+			return fmt.Errorf("lease auto-retention job: %v %v", leased, err)
+		}
+		if err := q.Acknowledge(job.ID); err != nil {
+			return fmt.Errorf("ack auto-retention job: %w", err)
+		}
+		if i < 2 {
+			oldIDs = append(oldIDs, job.ID)
+		}
+	}
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	for _, id := range oldIDs {
+		if _, err := store.DB().Exec(
+			`UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			cutoff.Format(time.RFC3339Nano), id); err != nil {
+			return fmt.Errorf("age auto-retention job: %w", err)
+		}
+	}
+
+	completed, totalEvents := retentionCounts(store)
+	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
+
+	w := worker.NewWorker(q, func(context.Context, queue.Job) error { return nil }, kind,
+		worker.WithPollInterval(10*time.Millisecond),
+		worker.WithLeaseDuration(time.Minute),
+		worker.WithRetention(queue.PrunePolicy{MaxJobAge: maxAge}, interval),
+	)
+	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Run(runCtx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for completed != 1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		completed, totalEvents = retentionCounts(store)
+	}
+	cancel()
+	<-done
+
+	fmt.Printf("  worker removed the old jobs: completed: %d  events: %d\n", completed, totalEvents)
+	fmt.Println("the worker keeps the store small while it processes work.")
 	return nil
 }
 
