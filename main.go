@@ -24,7 +24,7 @@ Commands:
   prune    Apply retention policy to the queue
   seed     Load bundled sample data
   metrics  Expose queue state for Prometheus
-  web      Serve a read-only dashboard for the queue
+  web      Serve the queue dashboard and requeue dead letters
   demo     Run a self-contained scenario with fault injection
 
 Use <command> -help for command flags.`)

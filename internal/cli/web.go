@@ -12,10 +12,11 @@ import (
 	"github.com/local-first-job-queue/internal/web"
 )
 
-// Web serves a read-only inspection dashboard over HTTP. The dashboard reads
+// Web serves an inspection dashboard over HTTP. The dashboard reads
 // the same SQLite store as the other commands, so it shows live queue state
-// without stopping a worker. The server also exposes a small JSON API under
-// /api for scripts and other tools. When -user and -pass are set, every page
+// without stopping a worker. Dead-lettered jobs can be requeued from the
+// dashboard. The server also exposes a small JSON API under /api for scripts
+// and other tools. When -user and -pass are set, every page
 // and API route requires those HTTP Basic credentials.
 func Web(args []string) error {
 	fs := flag.NewFlagSet("web", flag.ExitOnError)

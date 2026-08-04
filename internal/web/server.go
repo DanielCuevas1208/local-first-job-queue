@@ -1,6 +1,7 @@
-// Package web serves a read-only inspection dashboard for the queue over HTTP.
+// Package web serves an inspection dashboard for the queue over HTTP.
 // It reads the same SQLite store as the CLI commands, so a browser shows live
-// queue state without stopping a worker. The package also exposes a small JSON
+// queue state without stopping a worker. Dead-lettered jobs can be requeued
+// through an authenticated JSON action. The package also exposes a small JSON
 // API under /api for scripts and other tools.
 package web
 
@@ -11,9 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/local-first-job-queue/internal/queue"
@@ -45,6 +48,7 @@ var orderedStates = []queue.JobState{
 // Server renders the dashboard and JSON API against one store.
 type Server struct {
 	store *queue.SQLiteStore
+	queue *queue.Queue
 	tmpls *template.Template
 	auth  *basicAuth
 }
@@ -89,7 +93,7 @@ func New(store *queue.SQLiteStore, opts ...Option) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse templates: %w", err)
 	}
-	s := &Server{store: store, tmpls: tmpls}
+	s := &Server{store: store, queue: queue.NewQueue(store), tmpls: tmpls}
 	for _, o := range opts {
 		o(s)
 	}
@@ -130,6 +134,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/summary", s.handleAPISummary)
 	mux.HandleFunc("GET /api/jobs", s.handleAPIJobs)
 	mux.HandleFunc("GET /api/jobs/{id}", s.handleAPIJob)
+	mux.HandleFunc("POST /api/jobs/{id}/requeue", s.handleAPIRequeue)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.Handle("GET /static/", http.FileServer(http.FS(staticFS)))
 
@@ -363,4 +368,86 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
+}
+
+// requeueRequest carries the optional corrections an operator can make before
+// returning a dead-lettered job to the pending queue.
+type requeueRequest struct {
+	MaxAttempts *int    `json:"max_attempts"`
+	Payload     *string `json:"payload"`
+}
+
+// handleAPIRequeue returns one dead-lettered job to pending. JSON is required
+// so a cross-site HTML form cannot trigger the state-changing action.
+func (s *Server) handleAPIRequeue(w http.ResponseWriter, r *http.Request) {
+	contentType := strings.ToLower(r.Header.Get("Content-Type"))
+	if !strings.HasPrefix(contentType, "application/json") {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "content type must be application/json"})
+		return
+	}
+
+	var input requeueRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil && err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid requeue request"})
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request must contain one JSON object"})
+		return
+	}
+	if input.MaxAttempts != nil && *input.MaxAttempts < 1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_attempts must be at least 1"})
+		return
+	}
+
+	id := r.PathValue("id")
+	job, err := s.store.GetJob(id)
+	if err == sql.ErrNoRows {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+		return
+	}
+	if err != nil {
+		s.internalError(w, err)
+		return
+	}
+	if job.State != queue.StateDeadLetter {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "job is not dead-lettered"})
+		return
+	}
+
+	var opts []queue.RequeueOption
+	if input.MaxAttempts != nil {
+		opts = append(opts, queue.RequeueWithMaxAttempts(*input.MaxAttempts))
+	}
+	if input.Payload != nil {
+		opts = append(opts, queue.RequeueWithPayload(*input.Payload))
+	}
+	updated, err := s.queue.Requeue(id, opts...)
+	if err != nil {
+		// The state may change between the read above and the update when two
+		// operators act at once. Read it again before choosing the response.
+		current, currentErr := s.store.GetJob(id)
+		if currentErr == nil && current.State != queue.StateDeadLetter {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "job is not dead-lettered"})
+			return
+		}
+		if currentErr == sql.ErrNoRows {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "job not found"})
+			return
+		}
+		if currentErr != nil {
+			s.internalError(w, currentErr)
+			return
+		}
+		s.internalError(w, err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job":     updated,
+		"message": "job requeued",
+	})
 }

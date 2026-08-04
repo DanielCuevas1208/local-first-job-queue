@@ -147,6 +147,8 @@ a:hover { text-decoration: underline; }
 
 .btn:hover { border-color: var(--accent); color: var(--accent); }
 
+.btn-small { padding: 0.25rem 0.55rem; font-size: 12px; }
+
 .jobs-head {
   display: flex;
   align-items: baseline;
@@ -190,6 +192,8 @@ td.num { text-align: right; font-family: var(--mono); }
 th.num { text-align: right; }
 
 td.id-cell { font-family: var(--mono); }
+
+td.actions-cell { white-space: nowrap; }
 
 .badge {
   display: inline-block;

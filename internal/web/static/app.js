@@ -1,4 +1,4 @@
-// app.js drives the read-only dashboard. It fetches the JSON API and renders
+// app.js drives the dashboard and its guarded requeue action. It fetches the JSON API and renders
 // the job table, then refreshes the view while auto-refresh is enabled. All
 // user data is written with textContent, never as HTML, so job payloads cannot
 // inject markup.
@@ -74,6 +74,20 @@
     appendText(tr, fmtUTC(job.updated_at));
     appendText(tr, fmtUTC(job.run_at));
     appendText(tr, fmtUTC(job.leased_until));
+
+    var actionsCell = document.createElement("td");
+    actionsCell.className = "actions-cell";
+    if (job.state === "dead_letter") {
+      var button = document.createElement("button");
+      button.className = "btn btn-small requeue-btn";
+      button.type = "button";
+      button.textContent = "Requeue";
+      button.setAttribute("data-job-id", job.id);
+      actionsCell.appendChild(button);
+    } else {
+      actionsCell.textContent = "none";
+    }
+    tr.appendChild(actionsCell);
 
     return tr;
   }
@@ -173,6 +187,55 @@
       refresh().then(scheduleNext);
     }, 250);
   }
+
+  function requeueJob(button) {
+    var id = button.getAttribute("data-job-id");
+    if (!window.confirm("Requeue this dead-lettered job?")) return;
+
+    button.disabled = true;
+    button.textContent = "Requeueing...";
+    return fetch("/api/jobs/" + encodeURIComponent(id) + "/requeue", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          var data = text ? JSON.parse(text) : {};
+          if (!res.ok) {
+            throw new Error(data.error || "HTTP " + res.status);
+          }
+          return data;
+        });
+      })
+      .then(function () {
+        button.textContent = "Requeued";
+        if (jobsBody) {
+          return refresh().then(scheduleNext);
+        }
+        window.location.reload();
+      })
+      .catch(function (err) {
+        button.disabled = false;
+        button.textContent = "Requeue";
+        if (jobsMeta) {
+          jobsMeta.textContent = "requeue failed: " + err.message;
+        } else {
+          window.alert("Requeue failed: " + err.message);
+        }
+      });
+  }
+
+  document.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target.closest) return;
+    var button = target.closest(".requeue-btn");
+    if (!button) return;
+    event.preventDefault();
+    requeueJob(button);
+  });
+
+  if (!stateSelect) return;
 
   stateSelect.addEventListener("change", onFilterChange);
   kindSelect.addEventListener("change", onFilterChange);

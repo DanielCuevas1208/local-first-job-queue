@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -30,6 +31,15 @@ func newServer(t *testing.T) (*Server, *queue.SQLiteStore, *queue.Queue) {
 func get(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func postJSON(t *testing.T, h http.Handler, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
@@ -275,6 +285,60 @@ func TestAPIJobDetail(t *testing.T) {
 	}
 }
 
+// TestAPIRequeueDeadLetter verifies that the dashboard action resets the
+// attempt budget, accepts a corrected payload, and appends an event.
+func TestAPIRequeueDeadLetter(t *testing.T) {
+	srv, _, q := newServer(t)
+	job, err := q.Enqueue("report", `{"broken":true}`, queue.WithMaxAttempts(1))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	leased, err := q.Lease(context.Background(), "report", time.Minute)
+	if err != nil || leased == nil {
+		t.Fatalf("lease: %v %v", leased, err)
+	}
+	if err := q.Fail(leased.ID, "invalid payload"); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	h := srv.Handler()
+	detail := get(t, h, "/job/"+job.ID)
+	if !strings.Contains(detail.Body.String(), "Requeue job") {
+		t.Fatalf("dead-letter detail page has no requeue action:\n%s", detail.Body.String())
+	}
+
+	rec := postJSON(t, h, "/api/jobs/"+job.ID+"/requeue", `{"payload":"fixed","max_attempts":2}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var result struct {
+		Job queue.Job `json:"job"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode requeue response: %v", err)
+	}
+	if result.Job.State != queue.StatePending || result.Job.RetryCount != 0 ||
+		result.Job.MaxAttempts != 2 || result.Job.Payload != "fixed" {
+		t.Errorf("unexpected requeued job: %+v", result.Job)
+	}
+	events, err := q.Inspect()
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	if len(events.Events) != 4 || events.Events[0].EventType != queue.EventRequeued {
+		t.Errorf("expected requeued event newest, got %+v", events.Events)
+	}
+	trailing := postJSON(t, h, "/api/jobs/"+job.ID+"/requeue", "{} null")
+	if trailing.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for trailing JSON value, got %d", trailing.Code)
+	}
+
+	repeat := postJSON(t, h, "/api/jobs/"+job.ID+"/requeue", `{}`)
+	if repeat.Code != http.StatusConflict {
+		t.Errorf("expected 409 for a pending job, got %d", repeat.Code)
+	}
+}
+
 // TestJobPageRenders verifies the job detail page shows the timeline and the
 // payload, and that an unknown job yields a 404 page.
 func TestJobPageRenders(t *testing.T) {
@@ -359,6 +423,10 @@ func TestBasicAuthGuardsPages(t *testing.T) {
 	api := get(t, h, "/api/jobs")
 	if api.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for anonymous API, got %d", api.Code)
+	}
+	write := postJSON(t, h, "/api/jobs/nope/requeue", `{}`)
+	if write.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for anonymous requeue, got %d", write.Code)
 	}
 
 	health := get(t, h, "/healthz")

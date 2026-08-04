@@ -34,7 +34,7 @@ The queue separates durable state from worker execution.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
 - `internal/fixture` provides repeatable sample workloads.
-- `internal/web` serves a read-only browser dashboard and a small JSON API.
+- `internal/web` serves a browser dashboard, requeue action, and small JSON API.
 
 A retention run removes old terminal jobs in one transaction.
 
@@ -271,7 +271,7 @@ The demo combines priority, retries, panic recovery, crash recovery, scheduling,
 jobqueue web [-addr <addr>] [-db <path>] [-user <name>] [-pass <password>]
 ```
 
-The command serves a read-only browser dashboard.
+The command serves a browser dashboard with a guarded dead-letter action.
 
 The default address is `:8080`.
 
@@ -284,6 +284,16 @@ The page refreshes itself every five seconds.
 The server also exposes a JSON API under `/api`.
 
 Use `-user` and `-pass` to require credentials for every page and API route.
+
+Click Requeue on a dead-lettered job.
+
+Use this endpoint to requeue a job with corrected data.
+
+```text
+POST /api/jobs/<id>/requeue
+Content-Type: application/json
+{"payload":"fixed","max_attempts":3}
+```
 
 The health endpoint stays open so load balancers can probe it.
 
@@ -421,7 +431,7 @@ Use `work -metrics-addr` to serve the same endpoint beside a worker.
 
 ### Web dashboard
 
-The `web` command serves a read-only dashboard in a browser.
+The `web` command serves a dashboard with one guarded write action.
 
 The dashboard reads the same SQLite store as every other command.
 
@@ -447,9 +457,11 @@ The JSON API supports scripts and other inspection tools.
 
 `GET /api/jobs/<id>` returns one job with its event timeline.
 
+`POST /api/jobs/<id>/requeue` returns a dead-lettered job to pending.
+
 `GET /healthz` reports readiness for load balancers.
 
-The dashboard never writes to the store.
+The dashboard writes only the requeue transition.
 
 It is safe to run beside a worker on the same database.
 
@@ -473,7 +485,7 @@ The password travels in clear text unless you add TLS.
 
 Put the dashboard behind a reverse proxy for HTTPS.
 
-The dashboard stays read-only, so a leaked credential cannot change jobs.
+The requeue action uses the same authentication guard as every API route.
 
 ### Scheduling
 
@@ -733,9 +745,9 @@ Run queue benchmarks with this command.
 go test ./internal/queue -run '^$' -bench Benchmark -benchmem -count=1
 ```
 
-Verification status: tests, vet, build, and benchmarks pass locally and in CI.
+Verification status: local tests, vet, build, and benchmarks pass.
 
-Race tests run in CI on Ubuntu.
+CI runs the same checks on Ubuntu with the race detector.
 
 The web tests cover the dashboard, the JSON API, payload escaping, and access control.
 
@@ -763,7 +775,7 @@ A high-priority stream can delay lower-priority jobs until aging lifts them.
 
 Workers share one file, so scaling across hosts needs a shared filesystem.
 
-The dashboard is read-only and does not manage jobs.
+The dashboard requeues dead letters, but it does not enqueue, edit, or delete jobs.
 
 Basic Auth sends the password in clear text without TLS.
 
@@ -783,10 +795,20 @@ Add a reverse proxy with HTTPS for any shared deployment.
 - [x] Job retention policies and event log cleanup.
 - [x] Scheduled auto-retention from the worker process.
 - [x] Report retention activity in metrics and the dashboard.
+- [x] Browser requeue for dead-lettered jobs.
+- [ ] Event history export for archival workflows.
 
 ### Release notes
 
-This release adds retention activity reporting.
+This release adds guarded browser requeue.
+
+Operators can return dead-lettered jobs to pending from the dashboard.
+
+The JSON action accepts corrected payloads and attempt budgets.
+
+The action requires JSON and shares the dashboard authentication guard.
+
+The previous release added retention activity reporting.
 
 Each non-empty retention run records its source, policy, and removal counts.
 

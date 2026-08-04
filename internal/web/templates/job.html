@@ -5,6 +5,9 @@
   <section class="job-head">
     <h1>Job <code class="job-id">{{.Job.ID}}</code></h1>
     <div class="badge state-{{.Job.State}}">{{.Job.State}}</div>
+    {{if eq .Job.State "dead_letter"}}
+    <button class="btn requeue-btn" type="button" data-job-id="{{.Job.ID}}">Requeue job</button>
+    {{end}}
   </section>
 
   <section class="grid">
