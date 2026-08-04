@@ -1,0 +1,84 @@
+{{define "title"}}Dashboard{{end}}
+{{define "content"}}
+<h1>Dashboard</h1>
+
+<div class="grid">
+{{range .Stats}}
+  <div class="stat {{stateClass .State}}">
+    <div class="num">{{.Count}}</div>
+    <div class="lbl">{{.State}}</div>
+  </div>
+{{end}}
+</div>
+
+<section class="card">
+  <h2>Jobs by kind and state</h2>
+  {{if .Kinds}}
+  <table>
+    <thead>
+      <tr><th>Kind</th><th>State</th><th>Count</th></tr>
+    </thead>
+    <tbody>
+    {{range .Kinds}}
+      <tr>
+        <td>{{.Kind}}</td>
+        <td><span class="badge {{stateClass .State}}">{{.State}}</span></td>
+        <td>{{.Count}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p>No jobs yet.</p>
+  {{end}}
+</section>
+
+<section class="card">
+  <h2>Recent events ({{len .Events}})</h2>
+  {{if .Events}}
+  <table>
+    <thead>
+      <tr><th>Time</th><th>Job</th><th>Event</th><th>Detail</th></tr>
+    </thead>
+    <tbody>
+    {{range .Events}}
+      <tr>
+        <td>{{fmtTime .Timestamp}}</td>
+        <td><a href="/jobs/{{.JobID}}">{{shortID .JobID}}</a></td>
+        <td><span class="badge event">{{.EventType}}</span></td>
+        <td>{{if .Metadata}}{{.Metadata}}{{else}}<span class="muted">none</span>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p>No events recorded yet.</p>
+  {{end}}
+</section>
+
+<section class="card">
+  <h2>Jobs ({{len .Jobs}})</h2>
+  {{if .Jobs}}
+  <table>
+    <thead>
+      <tr><th>ID</th><th>Kind</th><th>State</th><th>Priority</th><th>Attempts</th><th>Created</th><th>Payload</th></tr>
+    </thead>
+    <tbody>
+    {{range .Jobs}}
+      <tr>
+        <td><a href="/jobs/{{.ID}}">{{shortID .ID}}</a></td>
+        <td>{{.Kind}}</td>
+        <td><span class="badge {{stateClass .State}}">{{.State}}</span></td>
+        <td>{{.Priority}}</td>
+        <td>{{.RetryCount}}/{{.MaxAttempts}}</td>
+        <td>{{fmtTime .CreatedAt}}</td>
+        <td><code>{{.Payload}}</code></td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p>No jobs in the database.</p>
+  {{end}}
+</section>
+{{end}}
