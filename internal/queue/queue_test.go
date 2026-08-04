@@ -33,6 +33,18 @@ func newTestStoreWithAging(t *testing.T, interval time.Duration) *SQLiteStore {
 	return s
 }
 
+// backdate sets a job's creation time to an explicit value. Tests use it to
+// control list ordering without depending on wall-clock resolution, which can
+// leave two jobs with an identical timestamp.
+func backdate(t *testing.T, s *SQLiteStore, id string, at time.Time) {
+	t.Helper()
+	if _, err := s.db.Exec(
+		`UPDATE jobs SET created_at = ? WHERE id = ?`,
+		at.UTC().Format(sqliteTimeFormat), id); err != nil {
+		t.Fatalf("backdate job %s: %v", id, err)
+	}
+}
+
 func TestMigrationAddsPriorityToLegacyDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	raw, err := sql.Open("sqlite", path)
@@ -896,6 +908,204 @@ func TestGetStateKindCountsEmptyQueue(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Errorf("expected no event counts, got %+v", events)
+	}
+}
+
+// TestSearchJobsFiltersAndPaginates verifies the filtered job listing used by
+// the web dashboard. State, kind, and query filters each narrow the result,
+// and the pagination fields bound the returned slice.
+func TestSearchJobsFiltersAndPaginates(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+	ctx := context.Background()
+
+	if _, err := q.Enqueue("email", `{"to":"a@example.com"}`, WithIdempotencyKey("mail:1")); err != nil {
+		t.Fatalf("enqueue email: %v", err)
+	}
+	pending, err := q.Enqueue("report", `{"name":"nightly"}`, WithIdempotencyKey("report:1"))
+	if err != nil {
+		t.Fatalf("enqueue report: %v", err)
+	}
+	weekly, err := q.Enqueue("report", `{"name":"weekly"}`)
+	if err != nil {
+		t.Fatalf("enqueue report: %v", err)
+	}
+
+	// Give the pending reports distinct creation times. Without this, two
+	// fast enqueues can share one timestamp and the ID tie breaker decides the
+	// order, which is deterministic but not the creation order this test needs.
+	backdate(t, s, pending.ID, time.Now().UTC().Add(-2*time.Second))
+
+	leased, err := q.Lease(ctx, "email", time.Minute)
+	if err != nil || leased == nil {
+		t.Fatalf("lease email: %v %v", leased, err)
+	}
+	if err := q.Acknowledge(leased.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+
+	got, err := s.SearchJobs(JobFilter{})
+	if err != nil {
+		t.Fatalf("search all: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("expected 3 jobs, got %d", len(got))
+	}
+
+	got, err = s.SearchJobs(JobFilter{State: StatePending})
+	if err != nil {
+		t.Fatalf("search pending: %v", err)
+	}
+	if len(got) != 2 || got[0].ID != weekly.ID {
+		t.Errorf("expected pending jobs newest first, got %+v", got)
+	}
+
+	got, err = s.SearchJobs(JobFilter{Kind: "report"})
+	if err != nil {
+		t.Fatalf("search report: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("expected 2 report jobs, got %d", len(got))
+	}
+
+	got, err = s.SearchJobs(JobFilter{Query: "report:1"})
+	if err != nil {
+		t.Fatalf("search by idempotency key: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != pending.ID {
+		t.Errorf("expected the idempotency-key match, got %+v", got)
+	}
+
+	// Offset 1 skips the newest pending job (weekly), leaving the nightly
+	// report as the single page row.
+	got, err = s.SearchJobs(JobFilter{State: StatePending, Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("search paginated: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 job on the page, got %d", len(got))
+	}
+	if got[0].ID == weekly.ID {
+		t.Errorf("offset 1 should skip the newest pending job, got %+v", got)
+	}
+
+	// A page with a limit never exceeds that limit.
+	got, err = s.SearchJobs(JobFilter{State: StatePending, Limit: 2})
+	if err != nil {
+		t.Fatalf("search limited: %v", err)
+	}
+	if len(got) > 2 {
+		t.Errorf("expected at most 2 jobs, got %d", len(got))
+	}
+}
+
+// TestCountJobsMatchesSearch verifies that the count query agrees with the
+// filtered listing. The two queries share one filter builder, so a count and a
+// page of results never disagree on which jobs match.
+func TestCountJobsMatchesSearch(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	for _, k := range []string{"email", "email", "report"} {
+		if _, err := q.Enqueue(k, `{}`); err != nil {
+			t.Fatalf("enqueue %s: %v", k, err)
+		}
+	}
+
+	cases := []struct {
+		name   string
+		filter JobFilter
+		want   int
+	}{
+		{"all", JobFilter{}, 3},
+		{"kind email", JobFilter{Kind: "email"}, 2},
+		{"kind report", JobFilter{Kind: "report"}, 1},
+		{"state completed", JobFilter{State: StateCompleted}, 0},
+		{"query email", JobFilter{Query: "email"}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			count, err := s.CountJobs(tc.filter)
+			if err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			if count != tc.want {
+				t.Errorf("expected %d, got %d", tc.want, count)
+			}
+			jobs, err := s.SearchJobs(tc.filter)
+			if err != nil {
+				t.Fatalf("search: %v", err)
+			}
+			if len(jobs) != tc.want {
+				t.Errorf("search returned %d jobs, count said %d", len(jobs), count)
+			}
+		})
+	}
+}
+
+// TestGetKinds returns the distinct kinds in alphabetical order, so a filter
+// menu can offer a stable list.
+func TestGetKinds(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	if _, err := q.Enqueue("report", `{}`); err != nil {
+		t.Fatalf("enqueue report: %v", err)
+	}
+	if _, err := q.Enqueue("email", `{}`); err != nil {
+		t.Fatalf("enqueue email: %v", err)
+	}
+	if _, err := q.Enqueue("report", `{}`); err != nil {
+		t.Fatalf("enqueue report: %v", err)
+	}
+
+	kinds, err := s.GetKinds()
+	if err != nil {
+		t.Fatalf("kinds: %v", err)
+	}
+	want := []string{"email", "report"}
+	if len(kinds) != len(want) {
+		t.Fatalf("expected %v, got %v", want, kinds)
+	}
+	for i, w := range want {
+		if kinds[i] != w {
+			t.Errorf("kind %d: expected %s, got %s", i, w, kinds[i])
+		}
+	}
+}
+
+// TestSearchJobsOrderIsDeterministic verifies that jobs with the same creation
+// timestamp still list in a stable order. The ID tie breaker sorts ascending,
+// so pages stay consistent across refreshes.
+func TestSearchJobsOrderIsDeterministic(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	base := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		job, err := q.Enqueue("test", `{}`)
+		if err != nil {
+			t.Fatalf("enqueue: %v", err)
+		}
+		if _, err := s.db.Exec(
+			`UPDATE jobs SET created_at = ? WHERE id = ?`,
+			base.Format(sqliteTimeFormat), job.ID); err != nil {
+			t.Fatalf("backdate job: %v", err)
+		}
+	}
+
+	jobs, err := s.SearchJobs(JobFilter{})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("expected 3 jobs, got %d", len(jobs))
+	}
+	for i := 1; i < len(jobs); i++ {
+		if jobs[i-1].ID >= jobs[i].ID {
+			t.Fatalf("expected ascending id tie breaker, got %s then %s",
+				jobs[i-1].ID, jobs[i].ID)
+		}
 	}
 }
 

@@ -1,0 +1,33 @@
+{{define "head"}}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="brand-mark">&#9612;&#9613;&#9615;</span>
+      Local-first Durable Job Queue
+    </a>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/api/jobs" target="_blank" rel="noopener">JSON API</a>
+      <a href="/healthz">Health</a>
+    </nav>
+  </header>
+  <main class="wrap">
+{{end}}
+
+{{define "foot"}}
+  </main>
+  <footer class="foot">
+    <span>read-only dashboard</span>
+    <span>all state comes from the SQLite store</span>
+  </footer>
+</body>
+</html>
+{{end}}

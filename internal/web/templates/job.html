@@ -1,0 +1,52 @@
+{{define "job.html"}}
+{{template "head" .}}
+  <p class="back"><a href="/">&larr; back to dashboard</a></p>
+
+  <section class="job-head">
+    <h1>Job <code class="job-id">{{.Job.ID}}</code></h1>
+    <div class="badge state-{{.Job.State}}">{{.Job.State}}</div>
+  </section>
+
+  <section class="grid">
+    <div class="panel">
+      <h2>Details</h2>
+      <dl class="kv">
+        <dt>Kind</dt><dd>{{.Job.Kind}}</dd>
+        <dt>Priority</dt><dd>{{.Job.Priority}}</dd>
+        <dt>Attempts</dt><dd>{{.Job.RetryCount}} / {{.Job.MaxAttempts}}</dd>
+        <dt>Created</dt><dd>{{fmtTime .Job.CreatedAt}}</dd>
+        <dt>Updated</dt><dd>{{fmtTime .Job.UpdatedAt}}</dd>
+        {{with .Job.IdempotencyKey}}<dt>Idempotency key</dt><dd>{{.}}</dd>{{end}}
+        {{with .Job.RunAt}}<dt>Run at</dt><dd>{{fmtTime .}}</dd>{{end}}
+        {{with .Job.LeasedUntil}}<dt>Lease until</dt><dd>{{fmtTime .}}</dd>{{end}}
+      </dl>
+    </div>
+    <div class="panel">
+      <h2>Payload</h2>
+      <pre class="payload">{{.Job.Payload}}</pre>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Event log ({{len .Events}})</h2>
+    {{if .Events}}
+    <table class="events-table">
+      <thead>
+        <tr><th>Time</th><th>Type</th><th>Metadata</th></tr>
+      </thead>
+      <tbody>
+        {{range .Events}}
+        <tr>
+          <td class="mono">{{fmtTime .Timestamp}}</td>
+          <td><span class="badge ev-{{.EventType}}">{{.EventType}}</span></td>
+          <td class="mono">{{if .Metadata}}{{.Metadata}}{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <p class="muted">No events recorded for this job.</p>
+    {{end}}
+  </section>
+{{template "foot" .}}
+{{end}}

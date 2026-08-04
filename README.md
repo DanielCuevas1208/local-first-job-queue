@@ -2,7 +2,13 @@
 
 A small durable background queue built with Go and SQLite.
 
-The project shows leases, retries, idempotency, crash recovery, priority dispatch, priority aging, a dead-letter queue, Prometheus metrics, and an append-only event log.
+The project shows leases, retries, idempotency, and crash recovery.
+
+It adds priority dispatch, priority aging, and a dead-letter queue.
+
+It provides Prometheus metrics and an append-only event log.
+
+It includes a browser dashboard and shared-file horizontal scaling.
 
 ## Value
 
@@ -22,6 +28,7 @@ The queue separates durable state from worker execution.
 - `internal/cli` renders commands, snapshots, history, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
 - `internal/fixture` provides repeatable sample workloads.
+- `internal/web` serves a read-only browser dashboard and a small JSON API.
 
 A job starts as `pending`.
 
@@ -32,6 +39,10 @@ The worker acknowledges success or records failure.
 An expired lease returns to the queue during recovery.
 
 Each transition appends an event with a timestamp and optional metadata.
+
+A lease claim runs as one atomic write.
+
+Several worker processes can share one SQLite file without double-leasing a job.
 
 ## Setup
 
@@ -59,6 +70,29 @@ Run the deterministic showcase with this command.
 ```text
 go run . demo
 ```
+
+The demo prints a command that opens the dashboard for its database.
+
+Run a worker with a browser dashboard on the same database.
+
+```text
+./jobqueue work -kind email &
+./jobqueue web
+```
+
+Open the printed address in a browser.
+
+Run several workers on one database file.
+
+```text
+./jobqueue work -kind email &
+./jobqueue work -kind email &
+./jobqueue web
+```
+
+Each worker claims jobs atomically from the shared file.
+
+No job runs twice, even when workers start together.
 
 Load sample jobs with this command.
 
@@ -162,6 +196,26 @@ jobqueue demo [-db <path>] [-keep] [-run <duration>] [-kind <type>]
 
 The demo combines priority, retries, panic recovery, crash recovery, scheduling, priority aging, and dead-letter requeue.
 
+### `web`
+
+```text
+jobqueue web [-addr <addr>] [-db <path>]
+```
+
+The command serves a read-only browser dashboard.
+
+The default address is `:8080`.
+
+The dashboard shows state counts, filters, and a live job table.
+
+Each job page shows its payload and full event timeline.
+
+The page refreshes itself every five seconds.
+
+The server also exposes a JSON API under `/api`.
+
+Use `-addr 127.0.0.1:8080` to bind to one interface.
+
 ## Features
 
 ### Leases
@@ -169,6 +223,8 @@ The demo combines priority, retries, panic recovery, crash recovery, scheduling,
 A lease gives one worker temporary ownership of a job.
 
 An expired lease becomes recoverable.
+
+One atomic statement claims a lease, so shared-file workers stay safe.
 
 ### Priority dispatch
 
@@ -230,6 +286,24 @@ Recovery consumes an attempt and records a `recovered` event.
 
 A recovered job with no attempts left enters the dead-letter queue.
 
+### Horizontal scaling
+
+Several worker processes can share one SQLite file.
+
+Each worker opens its own store connection.
+
+The lease claim runs as one atomic SQL statement.
+
+Two workers cannot lease the same job, even when they claim together.
+
+Concurrent recovery applies each orphan exactly once.
+
+WAL mode lets one writer and many readers work at the same time.
+
+Scale worker processes without changing the code.
+
+SQLite serializes writers, so the shared file has a write ceiling.
+
 ### Event log
 
 Every state change appends one event row.
@@ -259,6 +333,38 @@ The output order stays stable across scrapes.
 Use the `metrics` command for one snapshot or a live endpoint.
 
 Use `work -metrics-addr` to serve the same endpoint beside a worker.
+
+### Web dashboard
+
+The `web` command serves a read-only dashboard in a browser.
+
+The dashboard reads the same SQLite store as every other command.
+
+It shows one count card per state, plus a total event count.
+
+State, kind, and search filters narrow the job table.
+
+The search field matches job IDs, idempotency keys, and payloads.
+
+Each job links to a detail page with its full event timeline.
+
+The page refreshes every five seconds while the tab is open.
+
+The server embeds all templates and static files in the binary.
+
+The JSON API supports scripts and other inspection tools.
+
+`GET /api/summary` reports state counts, kinds, and the event total.
+
+`GET /api/jobs` lists matching jobs with pagination fields.
+
+`GET /api/jobs/<id>` returns one job with its event timeline.
+
+`GET /healthz` reports readiness for load balancers.
+
+The dashboard never writes to the store.
+
+It is safe to run beside a worker on the same database.
 
 ### Scheduling
 
@@ -335,9 +441,54 @@ jobqueue_events_total{type="dead_lettered"} 1
 jobqueue_events_total{type="requeued"} 1
 ```
 
+Point a browser at the dashboard to inspect the same store.
+
+```text
+./jobqueue web -db queue.db
+```
+
+The JSON API returns the same view for scripts.
+
+```text
+curl -s http://localhost:8080/api/jobs?state=pending&limit=2
+```
+
+```json
+{
+  "jobs": [
+    {
+      "id": "3f9e1b2a-7d0c-4b6a-9e2f-1c8d4a7b5e01",
+      "kind": "email",
+      "payload": "{\"to\":\"user@example.com\"}",
+      "state": "pending",
+      "retry_count": 0,
+      "max_attempts": 3,
+      "priority": 20,
+      "created_at": "2026-08-04T05:53:56.083712Z",
+      "updated_at": "2026-08-04T05:53:56.083712Z"
+    }
+  ],
+  "total": 1,
+  "limit": 2,
+  "offset": 0
+}
+```
+
+The dashboard and the API read the live SQLite store.
+
 The demo uses generated job IDs and current timestamps.
 
 The final counts depend on the scenario and run deadline.
+
+The demo ends with commands to inspect the results.
+
+The final line opens the same database in a browser dashboard.
+
+```text
+view it in a browser with: jobqueue web -db "queue.db"
+```
+
+The dashboard shows the same state, events, and metrics in a page.
 
 ## Verification
 
@@ -364,6 +515,10 @@ Verification status: tests, vet, build, and benchmarks pass locally and in CI.
 
 Race tests run in CI on Ubuntu.
 
+The web tests cover the dashboard, the JSON API, and payload escaping.
+
+The shared-file tests cover multi-process leases, recovery, and worker scaling.
+
 ## Limitations
 
 SQLite serializes writes through one store connection.
@@ -374,9 +529,13 @@ Jobs and events remain until an operator removes them.
 
 A high-priority stream can delay lower-priority jobs until aging lifts them.
 
-The worker is one process and does not coordinate across hosts.
+Workers share one file, so scaling across hosts needs a shared filesystem.
 
-The project does not provide a web interface.
+The dashboard is read-only and does not manage jobs.
+
+The dashboard does not authenticate access.
+
+Run it on a trusted network or bind it to localhost.
 
 ## Roadmap
 
@@ -386,12 +545,57 @@ The project does not provide a web interface.
 - [x] Priority aging to prevent starvation.
 - [x] Dead-letter queue with requeue of permanently failed jobs.
 - [x] Prometheus metrics for queue inspection.
-- [ ] Web UI for queue inspection.
-- [ ] Horizontal scaling with a shared SQLite file.
+- [x] Browser dashboard for queue inspection.
+- [x] Horizontal scaling with a shared SQLite file.
+- [ ] Authenticated dashboard access for shared deployments.
 
 ### Release notes
 
-This release adds Prometheus metrics.
+This release adds horizontal scaling with a shared SQLite file.
+
+A lease claim now runs as one atomic SQL statement.
+
+Several worker processes can share one database file without double-leasing a job.
+
+Concurrent crash recovery applies each orphan exactly once.
+
+The store enables WAL mode with a normal sync mode for shared access.
+
+New tests race two store connections and two worker processes against one file.
+
+The tests prove that every job is claimed and acknowledged exactly once.
+
+The dashboard and the demo work unchanged beside any number of workers.
+
+The previous release added a read-only browser dashboard.
+
+The new `web` command serves the dashboard and a JSON API.
+
+The dashboard shows state counts, filters, and a live job table.
+
+Each job page shows its payload and full event timeline.
+
+The server embeds its templates and static files in the binary.
+
+The page refreshes every five seconds while the tab is open.
+
+The dashboard reads the same SQLite store as every command.
+
+The release also adds filtered store queries for the dashboard.
+
+`SearchJobs` returns a filtered, paginated job list.
+
+`CountJobs` reports the total across all pages.
+
+`GetKinds` lists the distinct job kinds in a stable order.
+
+This release upgrades the SQLite driver and GitHub Actions.
+
+The driver moves from `modernc.org/sqlite` 1.54.0 to 1.55.0.
+
+The workflow moves `actions/checkout` and `actions/setup-go` to v7.
+
+The previous release added Prometheus metrics.
 
 The new `metrics` command serves the exposition format over HTTP.
 

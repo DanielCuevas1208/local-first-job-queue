@@ -2,6 +2,8 @@ package worker
 
 import (
 	"context"
+	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -214,6 +216,84 @@ func waitFor(t *testing.T, cond func() bool, timeout time.Duration) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %s", timeout)
+}
+
+// TestTwoWorkersShareOneDatabase is the horizontal-scaling showcase. Two
+// worker processes, each with its own store connection, process one SQLite
+// file at the same time. Every job must run exactly once: the atomic lease
+// claim never hands the same job to both workers.
+func TestTwoWorkersShareOneDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	storeA, err := queue.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("store a: %v", err)
+	}
+	defer storeA.Close()
+	storeB, err := queue.NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("store b: %v", err)
+	}
+	defer storeB.Close()
+
+	qa, qb := queue.NewQueue(storeA), queue.NewQueue(storeB)
+
+	const jobs = 30
+	for i := 0; i < jobs; i++ {
+		if _, err := qa.Enqueue("shared", `{}`); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	var mu sync.Mutex
+	processed := map[string]int{}
+	handler := func(ctx context.Context, job queue.Job) error {
+		mu.Lock()
+		processed[job.ID]++
+		mu.Unlock()
+		return nil
+	}
+
+	wa := NewWorker(qa, handler, "shared",
+		WithPollInterval(10*time.Millisecond),
+		WithLeaseDuration(time.Minute),
+		WithConcurrency(2),
+	)
+	wb := NewWorker(qb, handler, "shared",
+		WithPollInterval(10*time.Millisecond),
+		WithLeaseDuration(time.Minute),
+		WithConcurrency(2),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = wa.Run(ctx)
+		_ = wb.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(processed) == jobs
+	}, 5*time.Second)
+	cancel()
+	<-done
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(processed) != jobs {
+		t.Fatalf("expected %d jobs processed, got %d", jobs, len(processed))
+	}
+	for id, n := range processed {
+		if n != 1 {
+			t.Errorf("job %s processed %d times", id, n)
+		}
+	}
 }
 
 // TestRecoveryEventSequence simulates a worker that leases a job and then

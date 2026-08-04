@@ -1,0 +1,77 @@
+{{define "index.html"}}
+{{template "head" .}}
+  <section class="cards">
+    {{range .Summary.States}}
+    <div class="card state-{{.State}}">
+      <div class="card-label">{{.State}}</div>
+      <div class="card-value" data-state="{{.State}}">{{.Count}}</div>
+    </div>
+    {{end}}
+    <div class="card">
+      <div class="card-label">events</div>
+      <div class="card-value">{{.Summary.EventsTotal}}</div>
+    </div>
+  </section>
+
+  <section class="filters">
+    <label class="field">
+      <span>State</span>
+      <select id="filter-state">
+        <option value="">all</option>
+        <option value="pending">pending</option>
+        <option value="leased">leased</option>
+        <option value="completed">completed</option>
+        <option value="dead_letter">dead_letter</option>
+        <option value="failed">failed</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Kind</span>
+      <select id="filter-kind">
+        <option value="">all</option>
+        {{range .Summary.Kinds}}
+        <option value="{{.}}">{{.}}</option>
+        {{end}}
+      </select>
+    </label>
+    <label class="field grow">
+      <span>Search</span>
+      <input id="filter-q" type="search" placeholder="id, idempotency key, or payload" autocomplete="off">
+    </label>
+    <label class="field check">
+      <input id="auto-refresh" type="checkbox" checked>
+      <span>auto-refresh 5s</span>
+    </label>
+    <button id="refresh-now" class="btn" type="button">Refresh</button>
+  </section>
+
+  <section class="jobs">
+    <div class="jobs-head">
+      <h1>Jobs</h1>
+      <span id="jobs-meta" class="muted">loading&hellip;</span>
+    </div>
+    <div class="table-scroll">
+      <table class="jobs-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Kind</th>
+            <th>State</th>
+            <th class="num">Priority</th>
+            <th class="num">Attempts</th>
+            <th>Created</th>
+            <th>Updated</th>
+            <th>Run at</th>
+            <th>Lease until</th>
+          </tr>
+        </thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+    </div>
+    <p id="jobs-empty" class="empty hidden">No jobs match the current filters.</p>
+  </section>
+
+  <p id="last-updated" class="muted"></p>
+{{template "foot" .}}
+<script src="/static/app.js"></script>
+{{end}}
