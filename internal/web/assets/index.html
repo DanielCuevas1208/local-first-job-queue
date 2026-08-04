@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local-first Durable Job Queue</title>
+<style>
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --line: #e3e5e9;
+    --ink: #1f2329;
+    --muted: #6b7280;
+    --accent: #4f46e5;
+    --accent-ink: #ffffff;
+    --pending: #b45309;
+    --pending-bg: #fef3c7;
+    --leased: #1d4ed8;
+    --leased-bg: #dbeafe;
+    --completed: #15803d;
+    --completed-bg: #dcfce7;
+    --dead: #b91c1c;
+    --dead-bg: #fee2e2;
+    --failed: #7c2d12;
+    --failed-bg: #ffedd5;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  header {
+    background: var(--accent);
+    color: var(--accent-ink);
+    padding: 14px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 17px; font-weight: 600; }
+  header .db { margin: 2px 0 0; font-size: 12px; opacity: 0.85; font-family: var(--mono); }
+  .controls { display: flex; align-items: center; gap: 12px; font-size: 12px; }
+  .controls a { color: var(--accent-ink); }
+  button {
+    font: inherit;
+    border: 1px solid var(--line);
+    background: var(--panel);
+    color: var(--ink);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .card .num { font-size: 26px; font-weight: 650; }
+  .card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 18px; align-items: start; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px 16px;
+    margin-bottom: 18px;
+  }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+  .panel h2 { margin: 0; font-size: 14px; font-weight: 650; }
+  .filters { display: flex; gap: 8px; }
+  select, input[type="search"] {
+    font: inherit;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 5px 8px;
+    background: var(--panel);
+    color: var(--ink);
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th {
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #fafaff; }
+  tbody tr.selected { background: #eef0ff; }
+  tbody tr.selected td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .badge {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .b-pending   { color: var(--pending);   background: var(--pending-bg); }
+  .b-leased    { color: var(--leased);    background: var(--leased-bg); }
+  .b-completed { color: var(--completed); background: var(--completed-bg); }
+  .b-dead_letter, .b-dead-letter { color: var(--dead); background: var(--dead-bg); }
+  .b-failed    { color: var(--failed);    background: var(--failed-bg); }
+  .muted { color: var(--muted); }
+  .hidden { display: none; }
+  .detail-line { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .detail-line .k { color: var(--muted); }
+  .detail-line .v { font-family: var(--mono); font-size: 12px; word-break: break-all; text-align: right; }
+  .timeline { list-style: none; margin: 10px 0 0; padding: 0; }
+  .timeline li { display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+  .timeline .t { color: var(--muted); white-space: nowrap; font-family: var(--mono); }
+  .timeline .et { font-weight: 600; white-space: nowrap; }
+  .timeline .md { word-break: break-all; }
+  .meta { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .notice { margin-top: 10px; font-size: 12px; }
+  footer { max-width: 1200px; margin: 0 auto; padding: 0 20px 24px; color: var(--muted); font-size: 12px; }
+  .msg.ok { color: var(--completed); }
+  .msg.err { color: var(--dead); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Local-first Durable Job Queue</h1>
+    <p class="db">db: {{.DBPath}}</p>
+  </div>
+  <div class="controls">
+    <label><input type="checkbox" id="auto" checked> Auto (3s)</label>
+    <button id="refresh" type="button">Refresh</button>
+    <a href="/metrics">Prometheus</a>
+  </div>
+</header>
+
+<main>
+  <section id="summary" class="cards"></section>
+
+  <div class="layout">
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Jobs</h2>
+        <div class="filters">
+          <select id="state-filter" aria-label="Filter by state">
+            <option value="">All states</option>
+            <option value="pending">Pending</option>
+            <option value="leased">Leased</option>
+            <option value="completed">Completed</option>
+            <option value="dead_letter">Dead letter</option>
+            <option value="failed">Failed</option>
+          </select>
+          <input id="search" type="search" placeholder="Kind or payload" aria-label="Search jobs">
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>Kind</th><th>State</th><th>Priority</th>
+            <th>Attempts</th><th>Created</th><th>Payload</th>
+          </tr>
+        </thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+      <p id="jobs-empty" class="muted hidden">No jobs match the current filters.</p>
+    </section>
+
+    <aside class="panel">
+      <div class="panel-head"><h2>Job detail</h2></div>
+      <div id="detail-body"><p class="muted">Select a job to inspect its timeline.</p></div>
+    </aside>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head"><h2>Recent events</h2></div>
+    <table>
+      <thead><tr><th>Time</th><th>Job</th><th>Event</th><th>Metadata</th></tr></thead>
+      <tbody id="events-body"></tbody>
+    </table>
+  </section>
+
+  <p class="notice">This dashboard runs entirely on your machine. It reads the same SQLite store as the CLI tools.</p>
+</main>
+
+<footer>
+  <span id="status" class="msg"></span>
+</footer>
+
+<script>
+"use strict";
+
+const state = { selected: null, snapshot: null, detail: null };
+
+const el = (id) => document.getElementById(id);
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+function fmtTime(iso) {
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function shortID(id) { return id.length > 8 ? id.slice(0, 8) : id; }
+
+function shortPayload(p) {
+  if (!p) return "";
+  return p.length > 120 ? p.slice(0, 120) + "…" : p;
+}
+
+function stateClass(s) { return "b-" + esc(s).replace(/[^a-z0-9_-]/g, "-"); }
+
+function badge(s) {
+  return '<span class="badge ' + stateClass(s) + '">' + esc(s) + '</span>';
+}
+
+function setStatus(text, ok) {
+  const node = el("status");
+  node.textContent = text;
+  node.className = "msg " + (ok ? "ok" : "err");
+}
+
+async function getJSON(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    let text = "";
+    try { text = (await res.text()) || ""; } catch (e) {}
+    throw new Error(res.status + " " + res.statusText + (text ? ": " + text : ""));
+  }
+  return res.json();
+}
+
+function renderSummary(snap) {
+  const order = ["pending", "leased", "completed", "dead_letter", "failed"];
+  const labels = {
+    pending: "Pending", leased: "Leased", completed: "Completed",
+    dead_letter: "Dead letter", failed: "Failed"
+  };
+  el("summary").innerHTML = order.map((s) =>
+    '<div class="card"><div class="num">' + (snap.stats[s] || 0) +
+    '</div><div class="label">' + labels[s] + "</div></div>"
+  ).join("");
+}
+
+function filteredJobs(snap) {
+  const stateFilter = el("state-filter").value;
+  const q = el("search").value.trim().toLowerCase();
+  return snap.jobs.filter((j) => {
+    if (stateFilter && j.state !== stateFilter) return false;
+    if (!q) return true;
+    return (j.kind || "").toLowerCase().indexOf(q) !== -1 ||
+      (j.payload || "").toLowerCase().indexOf(q) !== -1;
+  });
+}
+
+function renderJobs(snap) {
+  const jobs = filteredJobs(snap);
+  el("jobs-empty").classList.toggle("hidden", jobs.length !== 0);
+  el("jobs-body").innerHTML = jobs.map((j) =>
+    "<tr data-id=\"" + esc(j.id) + "\" class=\"" +
+    (j.id === state.selected ? "selected" : "") + "\">" +
+    "<td class=\"mono\">" + esc(shortID(j.id)) + "</td>" +
+    "<td>" + esc(j.kind) + "</td>" +
+    "<td>" + badge(j.state) + "</td>" +
+    "<td>" + esc(j.priority) + "</td>" +
+    "<td>" + esc(j.retry_count) + "/" + esc(j.max_attempts) + "</td>" +
+    "<td class=\"mono\">" + esc(fmtTime(j.created_at)) + "</td>" +
+    '<td title="' + esc(j.payload || "") + '">' + esc(shortPayload(j.payload)) + "</td>" +
+    "</tr>"
+  ).join("");
+}
+
+function renderEvents(snap) {
+  el("events-body").innerHTML = snap.events.slice(0, 50).map((e) =>
+    "<tr>" +
+    "<td class=\"mono\">" + esc(fmtTime(e.timestamp)) + "</td>" +
+    "<td class=\"mono\">" + esc(shortID(e.job_id)) + "</td>" +
+    "<td>" + badge(e.event_type) + "</td>" +
+    "<td>" + esc(e.metadata || "") + "</td>" +
+    "</tr>"
+  ).join("");
+}
+
+function renderDetail() {
+  const d = state.detail;
+  if (!d) {
+    el("detail-body").innerHTML = '<p class="muted">Select a job to inspect its timeline.</p>';
+    return;
+  }
+  const j = d.job;
+  const fields = [
+    ["id", j.id], ["kind", j.kind], ["state", j.state],
+    ["priority", j.priority], ["attempts", j.retry_count + "/" + j.max_attempts],
+    ["idempotency_key", j.idempotency_key || ""],
+    ["created_at", fmtTime(j.created_at)], ["updated_at", fmtTime(j.updated_at)],
+    ["run_at", fmtTime(j.run_at)], ["leased_until", fmtTime(j.leased_until)],
+    ["payload", j.payload || ""]
+  ];
+  const requeueBtn = j.state === "dead_letter"
+    ? '<button id="requeue" type="button" class="primary">Requeue</button>'
+    : "";
+  el("detail-body").innerHTML =
+    fields.map((f) =>
+      '<div class="detail-line"><span class="k">' + esc(f[0]) +
+      '</span><span class="v">' + esc(f[1]) + "</span></div>"
+    ).join("") +
+    '<ul class="timeline">' +
+    d.events.map((e) =>
+      "<li><span class=\"t\">" + esc(fmtTime(e.timestamp)) +
+      '</span><span class="et">' + badge(e.event_type) +
+      '</span><span class="md">' + esc(e.metadata || "") + "</span></li>"
+    ).join("") +
+    "</ul>" +
+    '<div class="meta">' + requeueBtn + ' ' +
+    '<span id="requeue-msg"></span></div>';
+  const btn = el("requeue");
+  if (btn) btn.addEventListener("click", requeueSelected);
+}
+
+async function loadDetail(id) {
+  try {
+    state.detail = await getJSON("/api/jobs/" + encodeURIComponent(id));
+    renderDetail();
+  } catch (err) {
+    setStatus("Failed to load job detail: " + err.message, false);
+  }
+}
+
+async function requeueSelected() {
+  const btn = el("requeue");
+  const msg = el("requeue-msg");
+  btn.disabled = true;
+  try {
+    const job = await getJSON("/api/jobs/" + encodeURIComponent(state.selected) + "/requeue", {
+      method: "POST", headers: { "Content-Type": "application/json" }
+    });
+    msg.textContent = "Requeued as pending with attempts 0/" + job.max_attempts + ".";
+    msg.className = "msg ok";
+    await load();
+  } catch (err) {
+    msg.textContent = "Requeue failed: " + err.message;
+    msg.className = "msg err";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function load() {
+  try {
+    const snap = await getJSON("/api/snapshot");
+    state.snapshot = snap;
+    renderSummary(snap);
+    renderJobs(snap);
+    renderEvents(snap);
+    setStatus("Updated " + fmtTime(snap.now) + ".", true);
+  } catch (err) {
+    setStatus("Failed to load snapshot: " + err.message, false);
+  }
+}
+
+el("jobs-body").addEventListener("click", (ev) => {
+  const row = ev.target.closest("tr[data-id]");
+  if (!row) return;
+  state.selected = row.dataset.id;
+  document.querySelectorAll("tbody tr.selected").forEach((r) => r.classList.remove("selected"));
+  row.classList.add("selected");
+  loadDetail(state.selected);
+});
+
+el("refresh").addEventListener("click", load);
+
+const auto = el("auto");
+let timer = null;
+function syncAuto() {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (auto.checked) timer = setInterval(load, 3000);
+}
+auto.addEventListener("change", syncAuto);
+
+el("state-filter").addEventListener("change", () => renderJobs(state.snapshot));
+el("search").addEventListener("input", () => renderJobs(state.snapshot));
+
+syncAuto();
+load();
+</script>
+</body>
+</html>
