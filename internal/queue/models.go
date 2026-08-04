@@ -68,8 +68,8 @@ type KindStateCount struct {
 	Count int      `json:"count"`
 }
 
-// EventTypeCount reports how many events share one event type. The count is
-// monotonic while the event log keeps every row.
+// EventTypeCount reports how many events share one event type. The count grows
+// as jobs progress and can drop when a retention run trims the log.
 type EventTypeCount struct {
 	EventType EventType `json:"event_type"`
 	Count     int       `json:"count"`

@@ -8,6 +8,8 @@ It adds priority dispatch, priority aging, and a dead-letter queue.
 
 It provides Prometheus metrics and an append-only event log.
 
+A retention policy removes old terminal jobs and trims the log.
+
 It includes a browser dashboard and shared-file horizontal scaling.
 
 The dashboard can require HTTP Basic credentials for shared deployments.
@@ -31,6 +33,10 @@ The queue separates durable state from worker execution.
 - `internal/metrics` renders queue state in the Prometheus text format.
 - `internal/fixture` provides repeatable sample workloads.
 - `internal/web` serves a read-only browser dashboard and a small JSON API.
+
+A retention run removes old terminal jobs in one transaction.
+
+It deletes their events and caps the log of every job that stays.
 
 A job starts as `pending`.
 
@@ -111,6 +117,12 @@ go run . history <id> -db queue.db
 go run . requeue <id> -db queue.db
 ```
 
+Apply a retention policy with this command.
+
+```text
+go run . prune -age 168h -db queue.db
+```
+
 ## Commands
 
 ### `enqueue`
@@ -173,6 +185,36 @@ The job resets its attempt count and keeps its data.
 
 Use `-payload` to correct the job data before it runs again.
 
+### `prune`
+
+```text
+jobqueue prune [-age <duration>] [-max-events <n>] [-json] [-db <path>]
+```
+
+The command applies a retention policy to the queue.
+
+The `-age` limit removes terminal jobs whose last update is older than the duration.
+
+Terminal states are `completed`, `dead_letter`, and legacy `failed`.
+
+The command deletes those jobs and their events.
+
+The `-max-events` limit keeps only the newest events for every surviving job.
+
+Set at least one limit, or the command refuses to run.
+
+The command prints the number of removed jobs and events.
+
+Use `-json` to get the same result as JSON.
+
+A common policy keeps one week of work and a bounded log.
+
+```text
+jobqueue prune -age 168h -max-events 1000
+```
+
+Run the command again later to keep the store small.
+
 ### `seed`
 
 ```text
@@ -201,7 +243,7 @@ Use `-once` to print one snapshot and exit.
 jobqueue demo [-db <path>] [-keep] [-run <duration>] [-kind <type>]
 ```
 
-The demo combines priority, retries, panic recovery, crash recovery, scheduling, priority aging, and dead-letter requeue.
+The demo combines priority, retries, panic recovery, crash recovery, scheduling, priority aging, dead-letter requeue, and retention.
 
 ### `web`
 
@@ -321,6 +363,8 @@ Every state change appends one event row.
 
 The `history` command shows one job's complete timeline.
 
+Retention can trim old rows that fall outside a policy window.
+
 ### Metrics
 
 The exporter renders queue state in the Prometheus text format.
@@ -407,6 +451,34 @@ SQLite stores queue timestamps with nanosecond precision.
 
 Existing databases gain new columns through idempotent migrations.
 
+### Retention
+
+The `prune` command applies a retention policy to the store.
+
+The age limit removes terminal jobs older than the window.
+
+A terminal job reached `completed`, `dead_letter`, or legacy `failed`.
+
+The limit deletes each old job and its events in one transaction.
+
+Active jobs always survive, even when they are old.
+
+Pending, leased, and scheduled jobs can still make progress.
+
+The event cap keeps only the newest events for each surviving job.
+
+The cap stops the log of a long-lived job from growing without bound.
+
+A run with both limits applies them together.
+
+The transaction keeps the job and event deletes consistent.
+
+A zero-value policy removes nothing.
+
+Retention is idempotent; a second run finds nothing to delete.
+
+The demo shows a completed queue dropping to one job and three events.
+
 ## Sample output
 
 Run `jobqueue demo` to see a complete local scenario.
@@ -443,6 +515,14 @@ aging interval: 100ms; a job gains one priority point per interval it waits.
 
 lease order: <id> (aged) then <id> (fresh)
 the waiting job outranks the fresher higher-priority job.
+
+Retention
+---------
+retention age: 1h0m0s; terminal jobs older than that leave with their events.
+  completed: 3  events: 9
+  prune removed 2 job(s) and 6 event(s)
+  completed: 1  events: 3
+old terminal jobs left with their events; the log stays bounded.
 
 Queue state
 -----------
@@ -564,6 +644,8 @@ The web tests cover the dashboard, the JSON API, payload escaping, and access co
 
 The shared-file tests cover multi-process leases, recovery, and worker scaling.
 
+The retention tests cover the age limit, the event cap, and idempotent runs.
+
 ## Limitations
 
 SQLite serializes writes through one store connection.
@@ -571,6 +653,10 @@ SQLite serializes writes through one store connection.
 A sustained backlog can exceed the writer's capacity.
 
 Jobs and events remain until an operator removes them.
+
+The `prune` command removes terminal jobs and old events.
+
+No scheduled auto-prune runs from the worker yet.
 
 A high-priority stream can delay lower-priority jobs until aging lifts them.
 
@@ -593,11 +679,34 @@ Add a reverse proxy with HTTPS for any shared deployment.
 - [x] Browser dashboard for queue inspection.
 - [x] Horizontal scaling with a shared SQLite file.
 - [x] Authenticated dashboard access for shared deployments.
-- [ ] Job retention policies and event log cleanup.
+- [x] Job retention policies and event log cleanup.
+- [ ] Scheduled auto-retention from the worker process.
 
 ### Release notes
 
-This release adds optional authentication for the web dashboard.
+This release adds job retention policies and event log cleanup.
+
+The new `prune` command applies a retention policy to the queue.
+
+The `-age` limit removes terminal jobs older than the window.
+
+The limit deletes each job and its events in one transaction.
+
+The `-max-events` limit keeps only the newest events per surviving job.
+
+The command reports the number of removed jobs and events.
+
+A policy with no limits refuses to run.
+
+Retention runs are idempotent and safe to repeat.
+
+The store keeps active jobs even when they are old.
+
+New tests cover the age limit, the event cap, and combined policies.
+
+The demo shows a retention run on a completed queue.
+
+The previous release added optional authentication for the web dashboard.
 
 The `web` command accepts `-user` and `-pass` credentials.
 

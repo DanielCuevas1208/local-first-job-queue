@@ -151,6 +151,14 @@ func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
+// DB exposes the underlying SQL connection for advanced inspection and
+// maintenance tooling. Ordinary callers use the store methods, which keep the
+// schema and timestamp format consistent. The connection pool stays bounded to
+// one writer, matching the queue's serialized-write model.
+func (s *SQLiteStore) DB() *sql.DB {
+	return s.db
+}
+
 // InsertJob stores a new job. When the job carries an idempotency key that
 // already exists, the insert is a no-op and inserted returns false. Callers
 // then read the existing job back. This makes Enqueue safe under concurrent

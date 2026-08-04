@@ -190,6 +190,9 @@ func Demo(args []string) error {
 	if err := showPriorityAging(*kind); err != nil {
 		return err
 	}
+	if err := showRetention(*kind); err != nil {
+		return err
+	}
 
 	fmt.Println()
 	snap, err = q.Inspect()
@@ -208,6 +211,7 @@ func Demo(args []string) error {
 	fmt.Printf("\ninspect again with: jobqueue inspect -db %q\n", path)
 	fmt.Printf("inspect a job with: jobqueue history <id> -db %q\n", path)
 	fmt.Printf("requeue a dead letter with: jobqueue requeue <id> -db %q\n", path)
+	fmt.Printf("prune old jobs with: jobqueue prune -age 168h -db %q\n", path)
 	fmt.Printf("view it in a browser with: jobqueue web -db %q\n", path)
 	return nil
 }
@@ -267,6 +271,78 @@ func showPriorityAging(kind string) error {
 		shortID(first.ID), payloadName(first.Payload), shortID(second.ID), payloadName(second.Payload))
 	fmt.Println("the waiting job outranks the fresher higher-priority job.")
 	return nil
+}
+
+// showRetention demonstrates that a retention run removes old terminal jobs
+// together with their events. Three jobs complete; two of them are backdated
+// beyond the retention age. A prune run deletes the two old jobs and their
+// event rows, so the store keeps only recent work.
+func showRetention(kind string) error {
+	const maxAge = time.Hour
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-retention?mode=memory&cache=shared")
+	if err != nil {
+		return fmt.Errorf("open retention store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+	ctx := context.Background()
+
+	fmt.Println("\nRetention")
+	fmt.Println("---------")
+	fmt.Printf("retention age: %s; terminal jobs older than that leave with their events.\n", maxAge)
+
+	oldIDs := []string{}
+	for i := 0; i < 3; i++ {
+		job, err := q.Enqueue(kind, fmt.Sprintf(`{"name":"retention-%d"}`, i+1))
+		if err != nil {
+			return fmt.Errorf("enqueue retention: %w", err)
+		}
+		leased, err := q.Lease(ctx, kind, time.Minute)
+		if err != nil || leased == nil || leased.ID != job.ID {
+			return fmt.Errorf("lease retention job: %v %v", leased, err)
+		}
+		if err := q.Acknowledge(job.ID); err != nil {
+			return fmt.Errorf("ack retention job: %w", err)
+		}
+		if i < 2 {
+			oldIDs = append(oldIDs, job.ID)
+		}
+	}
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	for _, id := range oldIDs {
+		if _, err := store.DB().Exec(
+			`UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			cutoff.Format(time.RFC3339Nano), id); err != nil {
+			return fmt.Errorf("age retention job: %w", err)
+		}
+	}
+
+	completed, totalEvents := retentionCounts(store)
+	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
+
+	res, err := q.Prune(queue.PrunePolicy{MaxJobAge: maxAge})
+	if err != nil {
+		return fmt.Errorf("prune retention: %w", err)
+	}
+	completed, totalEvents = retentionCounts(store)
+	fmt.Printf("  prune removed %d job(s) and %d event(s)\n", res.JobsRemoved, res.EventsRemoved)
+	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
+	fmt.Println("old terminal jobs left with their events; the log stays bounded.")
+	return nil
+}
+
+// retentionCounts reports the completed-job count and the total event rows of
+// a store, so the retention segment can show the before and after state.
+func retentionCounts(store *queue.SQLiteStore) (completed, events int) {
+	if stats, err := store.GetQueueStats(); err == nil {
+		completed = stats[queue.StateCompleted]
+	}
+	if counts, err := store.GetEventTypeCounts(); err == nil {
+		for _, c := range counts {
+			events += c.Count
+		}
+	}
+	return completed, events
 }
 
 func shortID(id string) string {

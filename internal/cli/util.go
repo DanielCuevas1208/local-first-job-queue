@@ -7,6 +7,7 @@ import "strings"
 // flags and flags written as -flag=value are not included.
 var valueFlags = map[string]bool{
 	"-addr":            true,
+	"-age":             true,
 	"-aging":           true,
 	"-concurrency":     true,
 	"-db":              true,
@@ -14,6 +15,7 @@ var valueFlags = map[string]bool{
 	"-kind":            true,
 	"-lease":           true,
 	"-max-attempts":    true,
+	"-max-events":      true,
 	"-payload":         true,
 	"-poll":            true,
 	"-priority":        true,
