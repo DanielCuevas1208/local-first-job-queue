@@ -466,6 +466,56 @@ func (s *SQLiteStore) GetAllJobs() ([]Job, error) {
 	return s.queryJobs(`ORDER BY created_at DESC`)
 }
 
+// HistoryFilter selects job histories for an archive. Empty fields match every
+// job. Export ordering remains stable even when several jobs share a timestamp.
+type HistoryFilter struct {
+	State JobState
+	Kind  string
+}
+
+// GetJobHistories returns complete job timelines in creation order. It reads
+// current jobs only; retention may already have removed older terminal jobs.
+func (s *SQLiteStore) GetJobHistories(f HistoryFilter) ([]JobHistory, error) {
+	where, args := buildHistoryFilter(f)
+	jobs, err := s.queryJobs(where+` ORDER BY created_at ASC, id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query history jobs: %w", err)
+	}
+
+	histories := make([]JobHistory, 0, len(jobs))
+	for _, job := range jobs {
+		histories = append(histories, JobHistory{Job: job, Events: []Event{}})
+	}
+	if len(histories) == 0 {
+		return histories, nil
+	}
+
+	rows, err := s.db.Query(
+		`SELECT e.id, e.job_id, e.event_type, e.metadata, e.timestamp
+		 FROM events AS e
+		 JOIN jobs AS j ON j.id = e.job_id `+where+`
+		 ORDER BY e.job_id ASC, e.id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query history events: %w", err)
+	}
+	events, err := scanEvents(rows)
+	rows.Close()
+	if err != nil {
+		return nil, fmt.Errorf("scan history events: %w", err)
+	}
+
+	byJob := make(map[string][]Event, len(histories))
+	for _, event := range events {
+		byJob[event.JobID] = append(byJob[event.JobID], event)
+	}
+	for i := range histories {
+		if jobEvents := byJob[histories[i].Job.ID]; jobEvents != nil {
+			histories[i].Events = jobEvents
+		}
+	}
+	return histories, nil
+}
+
 // JobFilter selects a subset of jobs for listing and inspection tools. Empty
 // fields match every job. Query is a case-insensitive substring match against
 // the job ID, idempotency key, and payload. Limit caps the result; zero means
@@ -560,6 +610,23 @@ func buildJobFilter(f JobFilter) (string, []any) {
 		clauses = append(clauses, "(id LIKE ? OR idempotency_key LIKE ? OR payload LIKE ?)")
 		pattern := "%" + f.Query + "%"
 		args = append(args, pattern, pattern, pattern)
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
+}
+
+func buildHistoryFilter(f HistoryFilter) (string, []any) {
+	var clauses []string
+	var args []any
+	if f.State != "" {
+		clauses = append(clauses, "state = ?")
+		args = append(args, string(f.State))
+	}
+	if f.Kind != "" {
+		clauses = append(clauses, "kind = ?")
+		args = append(args, f.Kind)
 	}
 	if len(clauses) == 0 {
 		return "", nil

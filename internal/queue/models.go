@@ -60,6 +60,13 @@ type QueueSnapshot struct {
 	Stats  map[JobState]int `json:"stats"`
 }
 
+// JobHistory is the archival view of one job. Events stay in append order, so
+// an exported record can reconstruct the job timeline after it leaves SQLite.
+type JobHistory struct {
+	Job    Job     `json:"job"`
+	Events []Event `json:"events"`
+}
+
 // KindStateCount reports how many jobs share one kind and state. Metrics and
 // inspection tools group jobs by these two dimensions.
 type KindStateCount struct {

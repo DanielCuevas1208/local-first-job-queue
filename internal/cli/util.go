@@ -19,11 +19,13 @@ var valueFlags = map[string]bool{
 	"-payload":              true,
 	"-poll":                 true,
 	"-priority":             true,
+	"-out":                  true,
 	"-run-after":            true,
 	"-run-at":               true,
 	"-retention-age":        true,
 	"-retention-interval":   true,
 	"-retention-max-events": true,
+	"-state":                true,
 }
 
 // moveFirstPositionalToEnd moves positional arguments to the end of the slice.

@@ -16,6 +16,8 @@ It includes a browser dashboard and shared-file horizontal scaling.
 
 The dashboard can require HTTP Basic credentials for shared deployments.
 
+It exports current job snapshots and retained event histories as JSON Lines.
+
 ## Value
 
 Use this project to study queue behavior without an external service.
@@ -31,7 +33,7 @@ The queue separates durable state from worker execution.
 - `internal/queue` owns the public queue API and SQLite store.
 - `internal/worker` leases jobs, runs handlers, and applies scheduled retention.
 - `internal/fault` injects deterministic errors, panics, delays, and stalls.
-- `internal/cli` renders commands, snapshots, history, and the demo.
+- `internal/cli` renders commands, snapshots, history, archives, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
 - `internal/fixture` provides repeatable sample workloads.
 - `internal/web` serves a browser dashboard, requeue action, and small JSON API.
@@ -133,6 +135,12 @@ Apply a retention policy with this command.
 go run . prune -age 168h -db queue.db
 ```
 
+Export job histories before pruning when an archive must include old terminal work.
+
+```text
+go run . export -db queue.db -out history.jsonl
+```
+
 ## Commands
 
 ### `enqueue`
@@ -192,6 +200,26 @@ jobqueue history <job-id> [-json] [-db <path>]
 ```
 
 The command prints one job and its event timeline.
+
+### `export`
+
+```text
+jobqueue export [-db <path>] [-out <path>] [-kind <type>] [-state <state>]
+```
+
+The command writes one versioned JSON Lines record for each selected job.
+
+Each record contains the job snapshot and its ordered retained events.
+
+The default output is standard output.
+
+Use `-out -` for explicit standard output.
+
+Use `-kind` or `-state` to narrow the archive.
+
+```text
+jobqueue export -db queue.db -kind email -state completed -out email-history.jsonl
+```
 
 ### `requeue`
 
@@ -394,6 +422,16 @@ Every state change appends one event row.
 The `history` command shows one job's complete timeline.
 
 Retention can trim old rows that fall outside a policy window.
+
+### Event history export
+
+Export writes one archive record per current job.
+
+The record includes `schema_version`, job fields, and events in append order.
+
+JSON Lines supports pipes, line-based storage, and incremental readers.
+
+The archive contains only jobs and events still present in SQLite.
 
 ### Metrics
 
@@ -724,6 +762,14 @@ view it in a browser with: jobqueue web -db "queue.db"
 
 The dashboard shows the same state, events, and metrics in a page.
 
+Export output is line-oriented JSON.
+
+```text
+$ jobqueue export -db queue.db -out history.jsonl
+exported <count> job histories to history.jsonl
+{"schema_version":1,"job":{"id":"<id>","kind":"email","state":"completed"},"events":[{"event_type":"acknowledged"}]}
+```
+
 ## Verification
 
 Run the full test suite with this command.
@@ -751,6 +797,8 @@ CI runs the same checks on Ubuntu with the race detector.
 
 The web tests cover the dashboard, the JSON API, payload escaping, and access control.
 
+The export tests cover versioned JSON Lines output, stable history order, and filters.
+
 The shared-file tests cover multi-process leases, recovery, and worker scaling.
 
 The retention tests cover the age limit, the event cap, and idempotent runs.
@@ -777,6 +825,10 @@ Workers share one file, so scaling across hosts needs a shared filesystem.
 
 The dashboard requeues dead letters, but it does not enqueue, edit, or delete jobs.
 
+Export does not recover history removed by retention.
+
+Run export before pruning when an archive must preserve old terminal jobs.
+
 Basic Auth sends the password in clear text without TLS.
 
 Add a reverse proxy with HTTPS for any shared deployment.
@@ -796,9 +848,19 @@ Add a reverse proxy with HTTPS for any shared deployment.
 - [x] Scheduled auto-retention from the worker process.
 - [x] Report retention activity in metrics and the dashboard.
 - [x] Browser requeue for dead-lettered jobs.
-- [ ] Event history export for archival workflows.
+- [x] Event history export for archival workflows.
 
 ### Release notes
+
+This release adds versioned JSON Lines export for archival workflows.
+
+The `export` command writes one job snapshot and its retained events per line.
+
+Stable creation order makes repeated exports easy to compare.
+
+Kind and state filters reduce an archive to the required job set.
+
+Standard output supports pipes; `-out` writes a private file.
 
 This release adds guarded browser requeue.
 
