@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -13,13 +14,14 @@ import (
 type JobHandler func(ctx context.Context, job queue.Job) error
 
 type Worker struct {
-	queue         *queue.Queue
-	handler       JobHandler
-	pollInterval  time.Duration
-	leaseDuration time.Duration
-	kind          string
-	concurrency   int
-	retention     *retentionSpec
+	queue                *queue.Queue
+	handler              JobHandler
+	pollInterval         time.Duration
+	leaseDuration        time.Duration
+	leaseRenewalInterval time.Duration
+	kind                 string
+	concurrency          int
+	retention            *retentionSpec
 
 	mu      sync.Mutex
 	wg      sync.WaitGroup
@@ -45,6 +47,14 @@ func WithPollInterval(d time.Duration) WorkerOption {
 func WithLeaseDuration(d time.Duration) WorkerOption {
 	return func(w *Worker) {
 		w.leaseDuration = d
+	}
+}
+
+// WithLeaseRenewalInterval changes how often a running job renews its lease.
+// A non-positive value derives an interval of one-third of the lease duration.
+func WithLeaseRenewalInterval(d time.Duration) WorkerOption {
+	return func(w *Worker) {
+		w.leaseRenewalInterval = d
 	}
 }
 
@@ -147,21 +157,70 @@ func (w *Worker) processOne(ctx context.Context) {
 		return
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, w.leaseDuration)
-	defer cancel()
+	runCtx, cancel := context.WithCancel(ctx)
+	renewDone, renewErr := w.startLeaseRenewal(runCtx, cancel, *job)
 
 	err = w.runHandler(runCtx, *job)
+	cancel()
+	if renewDone != nil {
+		<-renewDone
+	}
+	select {
+	case leaseErr := <-renewErr:
+		if errors.Is(leaseErr, queue.ErrLeaseLost) {
+			log.Printf("lease lost for job %s; handler stopped", job.ID)
+		} else {
+			log.Printf("lease renewal stopped job %s: %v", job.ID, leaseErr)
+		}
+		return
+	default:
+	}
 	if err != nil {
 		log.Printf("job %s failed: %v", job.ID, err)
-		if ackErr := w.queue.Fail(job.ID, err.Error()); ackErr != nil {
+		if ackErr := w.queue.FailLease(job.ID, job.LeaseToken, err.Error()); ackErr != nil {
 			log.Printf("fail error for %s: %v", job.ID, ackErr)
 		}
 		return
 	}
 
-	if err := w.queue.Acknowledge(job.ID); err != nil {
+	if err := w.queue.AcknowledgeLease(job.ID, job.LeaseToken); err != nil {
 		log.Printf("ack error for %s: %v", job.ID, err)
 	}
+}
+
+// startLeaseRenewal starts a heartbeat for one leased job. A failed renewal
+// cancels the handler so it cannot finish work after another worker takes the
+// lease. The caller waits for the goroutine before acknowledging or retrying.
+func (w *Worker) startLeaseRenewal(ctx context.Context, cancel context.CancelFunc, job queue.Job) (<-chan struct{}, <-chan error) {
+	interval := w.leaseRenewalInterval
+	if interval <= 0 {
+		interval = w.leaseDuration / 3
+	}
+	if interval <= 0 || job.LeaseToken == "" {
+		return nil, nil
+	}
+
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				if _, err := w.queue.Renew(job.ID, job.LeaseToken, w.leaseDuration); err != nil {
+					errCh <- err
+					cancel()
+					return
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+	return done, errCh
 }
 
 // runHandler invokes the handler and converts a panic into an error. This keeps

@@ -103,6 +103,10 @@ type Queue struct {
 	store *SQLiteStore
 }
 
+// ErrLeaseLost means that a worker tried to renew or finish a lease it no
+// longer owns. The token check protects a recovered job from stale workers.
+var ErrLeaseLost = errors.New("lease lost")
+
 func NewQueue(store *SQLiteStore) *Queue {
 	return &Queue{store: store}
 }
@@ -208,7 +212,23 @@ func (q *Queue) Lease(ctx context.Context, kind string, leaseDuration time.Durat
 }
 
 func (q *Queue) Acknowledge(jobID string) error {
-	if err := q.store.CompleteJob(jobID); err != nil {
+	return q.acknowledge(jobID, "")
+}
+
+// AcknowledgeLease completes a job only when leaseToken still owns its lease.
+// Workers use this method so a stale handler cannot acknowledge a later lease.
+func (q *Queue) AcknowledgeLease(jobID, leaseToken string) error {
+	return q.acknowledge(jobID, leaseToken)
+}
+
+func (q *Queue) acknowledge(jobID, leaseToken string) error {
+	var err error
+	if leaseToken == "" {
+		err = q.store.CompleteJob(jobID)
+	} else {
+		err = q.store.CompleteJobWithToken(jobID, leaseToken)
+	}
+	if err != nil {
 		return fmt.Errorf("complete job: %w", err)
 	}
 	ev := Event{
@@ -223,16 +243,34 @@ func (q *Queue) Acknowledge(jobID string) error {
 }
 
 func (q *Queue) Fail(jobID string, errMsg string) error {
+	return q.fail(jobID, "", errMsg)
+}
+
+// FailLease records a failure only when leaseToken still owns the lease. A
+// stale worker leaves the current lease untouched and receives ErrLeaseLost.
+func (q *Queue) FailLease(jobID, leaseToken, errMsg string) error {
+	return q.fail(jobID, leaseToken, errMsg)
+}
+
+func (q *Queue) fail(jobID, leaseToken, errMsg string) error {
 	job, err := q.store.GetJob(jobID)
 	if err != nil {
 		return fmt.Errorf("get job: %w", err)
+	}
+	if leaseToken != "" && job.LeaseToken != leaseToken {
+		return fmt.Errorf("%w: job %s", ErrLeaseLost, jobID)
 	}
 
 	// MaxAttempts stores the maximum number of attempts, including the first.
 	// The current attempt is RetryCount plus one. Retry only when an additional
 	// attempt still fits inside the limit.
 	shouldRetry := job.RetryCount+1 < job.MaxAttempts
-	if err := q.store.FailJob(jobID, shouldRetry); err != nil {
+	if leaseToken == "" {
+		err = q.store.FailJob(jobID, shouldRetry)
+	} else {
+		err = q.store.FailJobWithToken(jobID, leaseToken, shouldRetry)
+	}
+	if err != nil {
 		return fmt.Errorf("fail job: %w", err)
 	}
 
@@ -252,6 +290,29 @@ func (q *Queue) Fail(jobID string, errMsg string) error {
 		return fmt.Errorf("log event: %w", err)
 	}
 	return nil
+}
+
+// Renew extends a leased job and records the new lease deadline. The token
+// makes renewal safe when a previous worker continues after lease recovery.
+func (q *Queue) Renew(jobID, leaseToken string, leaseDuration time.Duration) (*Job, error) {
+	job, err := q.store.RenewJob(jobID, leaseToken, leaseDuration)
+	if err != nil {
+		return nil, fmt.Errorf("renew lease: %w", err)
+	}
+	deadline := ""
+	if job.LeasedUntil != nil {
+		deadline = job.LeasedUntil.UTC().Format(time.RFC3339Nano)
+	}
+	event := Event{
+		JobID:     jobID,
+		EventType: EventLeaseRenewed,
+		Timestamp: time.Now().UTC(),
+		Metadata:  &deadline,
+	}
+	if err := q.store.AppendEvent(event); err != nil {
+		return nil, fmt.Errorf("log lease renewal: %w", err)
+	}
+	return &job, nil
 }
 
 // Recover returns orphaned leases to the pending state. A lease is orphaned
@@ -368,4 +429,12 @@ func newID() (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:]), nil
+}
+
+func newLeaseToken() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", b), nil
 }

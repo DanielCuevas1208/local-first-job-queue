@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/local-first-job-queue/internal/fault"
@@ -187,6 +188,9 @@ func Demo(args []string) error {
 		fmt.Println("reached the run deadline before the queue drained.")
 	}
 
+	if err := showLeaseRenewal(*kind); err != nil {
+		return err
+	}
 	if err := showPriorityAging(*kind); err != nil {
 		return err
 	}
@@ -217,6 +221,108 @@ func Demo(args []string) error {
 	fmt.Printf("prune old jobs with: jobqueue prune -age 168h -db %q\n", path)
 	fmt.Printf("view it in a browser with: jobqueue web -db %q\n", path)
 	return nil
+}
+
+// showLeaseRenewal demonstrates that a handler may run longer than its
+// initial lease. The worker renews the lease with a fenced token until the
+// handler completes, so recovery cannot hand the job to another worker.
+func showLeaseRenewal(kind string) error {
+	const (
+		leaseDuration = 75 * time.Millisecond
+		renewalEvery  = 15 * time.Millisecond
+		handlerTime   = 220 * time.Millisecond
+	)
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-lease-renewal?mode=memory&cache=shared")
+	if err != nil {
+		return fmt.Errorf("open lease renewal store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+	job, err := q.Enqueue(kind, "{}")
+	if err != nil {
+		return fmt.Errorf("enqueue lease renewal: %w", err)
+	}
+
+	started := make(chan struct{})
+	var once sync.Once
+	handler := func(ctx context.Context, _ queue.Job) error {
+		once.Do(func() { close(started) })
+		timer := time.NewTimer(handlerTime)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	w := worker.NewWorker(q, handler, kind,
+		worker.WithPollInterval(time.Millisecond),
+		worker.WithLeaseDuration(leaseDuration),
+		worker.WithLeaseRenewalInterval(renewalEvery),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		return fmt.Errorf("lease renewal demo handler did not start")
+	}
+	time.Sleep(120 * time.Millisecond)
+	mid, err := store.GetJob(job.ID)
+	if err != nil {
+		cancel()
+		<-done
+		return fmt.Errorf("inspect renewed lease: %w", err)
+	}
+	renewals, err := countEvents(store, queue.EventLeaseRenewed)
+	if err != nil {
+		cancel()
+		<-done
+		return fmt.Errorf("count lease renewals: %w", err)
+	}
+	fmt.Println("\nLease renewal")
+	fmt.Println("-------------")
+	fmt.Printf("a handler runs for %s with a %s lease and a %s heartbeat.\n", handlerTime, leaseDuration, renewalEvery)
+	fmt.Printf("  after 120ms: state=%s lease_renewals=%d\n", mid.State, renewals)
+	deadline := time.Now().Add(time.Second)
+	for mid.State != queue.StateCompleted && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		mid, err = store.GetJob(job.ID)
+		if err != nil {
+			cancel()
+			<-done
+			return fmt.Errorf("wait for renewed job: %w", err)
+		}
+	}
+	cancel()
+	<-done
+	if mid.State != queue.StateCompleted {
+		return fmt.Errorf("lease renewal demo ended in %s", mid.State)
+	}
+	finalRenewals, err := countEvents(store, queue.EventLeaseRenewed)
+	if err != nil {
+		return fmt.Errorf("count final lease renewals: %w", err)
+	}
+	fmt.Printf("  completed after %s; total lease_renewed events=%d\n", handlerTime, finalRenewals)
+	fmt.Println("the fenced worker kept ownership until acknowledgement.")
+	return nil
+}
+
+func countEvents(store *queue.SQLiteStore, eventType queue.EventType) (int, error) {
+	counts, err := store.GetEventTypeCounts()
+	if err != nil {
+		return 0, err
+	}
+	for _, count := range counts {
+		if count.EventType == eventType {
+			return count.Count, nil
+		}
+	}
+	return 0, nil
 }
 
 // showPriorityAging demonstrates that a job gains one priority point per aging

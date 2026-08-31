@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -93,6 +94,13 @@ func TestMigrationAddsPriorityToLegacyDatabase(t *testing.T) {
 	if job.Priority != 7 {
 		t.Fatalf("expected priority 7, got %d", job.Priority)
 	}
+	leased, err := NewQueue(store).Lease(context.Background(), "test", time.Minute)
+	if err != nil || leased == nil {
+		t.Fatalf("lease migrated job: %v %v", leased, err)
+	}
+	if leased.LeaseToken == "" {
+		t.Fatal("migrated database did not store a lease token")
+	}
 }
 
 func TestEnqueueAndInspect(t *testing.T) {
@@ -145,6 +153,96 @@ func TestLease(t *testing.T) {
 	}
 	if len(leasedAfter) != 1 {
 		t.Errorf("expected 1 leased, got %d", len(leasedAfter))
+	}
+}
+
+func TestRenewExtendsLeaseAndLogsEvent(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	if _, err := q.Enqueue("test", "{}"); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	leased, err := q.Lease(context.Background(), "test", 20*time.Millisecond)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if leased == nil || leased.LeaseToken == "" {
+		t.Fatalf("expected a fenced lease token, got %+v", leased)
+	}
+	initialDeadline := *leased.LeasedUntil
+
+	renewed, err := q.Renew(leased.ID, leased.LeaseToken, time.Minute)
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if renewed.LeasedUntil == nil || !renewed.LeasedUntil.After(initialDeadline) {
+		t.Fatalf("renewed deadline = %v, want after %v", renewed.LeasedUntil, initialDeadline)
+	}
+	stored, err := s.GetJob(leased.ID)
+	if err != nil {
+		t.Fatalf("get renewed job: %v", err)
+	}
+	if stored.LeaseToken != leased.LeaseToken {
+		t.Fatalf("renew changed lease token from %q to %q", leased.LeaseToken, stored.LeaseToken)
+	}
+	if err := q.AcknowledgeLease(leased.ID, leased.LeaseToken); err != nil {
+		t.Fatalf("acknowledge renewed lease: %v", err)
+	}
+
+	events, err := s.GetJobEvents(leased.ID)
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	want := []EventType{EventEnqueued, EventLeased, EventLeaseRenewed, EventAcknowledged}
+	if len(events) != len(want) {
+		t.Fatalf("events = %+v, want %d events", events, len(want))
+	}
+	for i, wantType := range want {
+		if events[i].EventType != wantType {
+			t.Errorf("event %d = %s, want %s", i, events[i].EventType, wantType)
+		}
+	}
+}
+
+func TestLeaseTokenFencesRecoveredWorker(t *testing.T) {
+	s := newTestStore(t)
+	q := NewQueue(s)
+
+	job, err := q.Enqueue("test", "{}")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	oldLease, err := q.Lease(context.Background(), "test", -time.Hour)
+	if err != nil || oldLease == nil {
+		t.Fatalf("old lease: %v %v", oldLease, err)
+	}
+	if _, err := q.Recover(); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	currentLease, err := q.Lease(context.Background(), "test", time.Minute)
+	if err != nil || currentLease == nil {
+		t.Fatalf("current lease: %v %v", currentLease, err)
+	}
+	if oldLease.LeaseToken == currentLease.LeaseToken {
+		t.Fatal("recovered lease reused the old token")
+	}
+
+	if _, err := q.Renew(job.ID, oldLease.LeaseToken, time.Minute); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("renew with stale token = %v, want ErrLeaseLost", err)
+	}
+	if err := q.AcknowledgeLease(job.ID, oldLease.LeaseToken); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("acknowledge with stale token = %v, want ErrLeaseLost", err)
+	}
+	got, err := s.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get current job: %v", err)
+	}
+	if got.State != StateLeased || got.LeaseToken != currentLease.LeaseToken {
+		t.Fatalf("stale worker changed current lease: %+v", got)
+	}
+	if err := q.AcknowledgeLease(job.ID, currentLease.LeaseToken); err != nil {
+		t.Fatalf("acknowledge current lease: %v", err)
 	}
 }
 

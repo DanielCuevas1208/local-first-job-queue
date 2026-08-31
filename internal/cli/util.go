@@ -14,6 +14,7 @@ var valueFlags = map[string]bool{
 	"-idempotency-key":      true,
 	"-kind":                 true,
 	"-lease":                true,
+	"-lease-renewal":        true,
 	"-max-attempts":         true,
 	"-max-events":           true,
 	"-payload":              true,

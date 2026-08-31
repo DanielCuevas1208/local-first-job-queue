@@ -70,7 +70,8 @@ func migrate(db *sql.DB) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			leased_until TEXT,
-			run_at TEXT
+			run_at TEXT,
+			lease_token TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS events (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +103,9 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := ensureColumn(db, "jobs", "run_at", "TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "jobs", "lease_token", "TEXT"); err != nil {
 		return err
 	}
 	indexes := []string{
@@ -208,7 +212,7 @@ func (s *SQLiteStore) InsertJob(j Job) (inserted bool, err error) {
 
 func (s *SQLiteStore) FindJobByIdempotencyKey(key string) (*Job, error) {
 	row := s.db.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token
 		 FROM jobs WHERE idempotency_key = ?`, key)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
@@ -222,7 +226,7 @@ func (s *SQLiteStore) FindJobByIdempotencyKey(key string) (*Job, error) {
 
 func (s *SQLiteStore) GetJob(id string) (Job, error) {
 	row := s.db.QueryRow(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token
 		 FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -234,16 +238,20 @@ func (s *SQLiteStore) GetJob(id string) (Job, error) {
 func (s *SQLiteStore) LeaseJob(kind string, leaseDuration time.Duration) (*Job, error) {
 	now := time.Now().UTC()
 	until := now.Add(leaseDuration)
+	leaseToken, err := newLeaseToken()
+	if err != nil {
+		return nil, fmt.Errorf("new lease token: %w", err)
+	}
 
 	orderBy, orderArgs := s.pendingOrderBy(now)
-	query := `UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?
+	query := `UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?, lease_token = ?
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE kind = ? AND state = 'pending' AND (run_at IS NULL OR run_at <= ?)
 			ORDER BY ` + orderBy + ` LIMIT 1
 		)
-		RETURNING id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at`
-	args := append([]any{until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), kind, now.Format(sqliteTimeFormat)}, orderArgs...)
+		RETURNING id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token`
+	args := append([]any{until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), leaseToken, kind, now.Format(sqliteTimeFormat)}, orderArgs...)
 
 	row := s.db.QueryRow(query, args...)
 	job, err := scanJob(row)
@@ -263,12 +271,16 @@ func (s *SQLiteStore) LeaseJob(kind string, leaseDuration time.Duration) (*Job, 
 func (s *SQLiteStore) LeaseJobByID(id string, leaseDuration time.Duration) (*Job, error) {
 	now := time.Now().UTC()
 	until := now.Add(leaseDuration)
+	leaseToken, err := newLeaseToken()
+	if err != nil {
+		return nil, fmt.Errorf("new lease token: %w", err)
+	}
 
 	row := s.db.QueryRow(
-		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?
+		`UPDATE jobs SET state = 'leased', leased_until = ?, updated_at = ?, lease_token = ?
 		 WHERE id = ? AND state = 'pending'
-		 RETURNING id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at`,
-		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), id)
+		 RETURNING id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token`,
+		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), leaseToken, id)
 	job, err := scanJob(row)
 	if err == sql.ErrNoRows {
 		existing, gerr := s.GetJob(id)
@@ -287,43 +299,100 @@ func (s *SQLiteStore) LeaseJobByID(id string, leaseDuration time.Duration) (*Job
 }
 
 func (s *SQLiteStore) CompleteJob(id string) error {
+	return s.completeJob(id, "")
+}
+
+// CompleteJobWithToken completes a job only when the supplied lease token
+// still owns it. Workers use this fenced form for acknowledgements.
+func (s *SQLiteStore) CompleteJobWithToken(id, leaseToken string) error {
+	return s.completeJob(id, leaseToken)
+}
+
+func (s *SQLiteStore) completeJob(id, leaseToken string) error {
 	now := time.Now().UTC()
-	result, err := s.db.Exec(
-		`UPDATE jobs SET state = 'completed', leased_until = NULL, updated_at = ?
-		 WHERE id = ? AND state = 'leased'`,
-		now.Format(sqliteTimeFormat), id)
+	query := `UPDATE jobs SET state = 'completed', leased_until = NULL, lease_token = NULL, updated_at = ?
+		 WHERE id = ? AND state = 'leased'`
+	args := []any{now.Format(sqliteTimeFormat), id}
+	if leaseToken != "" {
+		query += ` AND lease_token = ?`
+		args = append(args, leaseToken)
+	}
+	result, err := s.db.Exec(query, args...)
 	if err != nil {
 		return fmt.Errorf("complete job: %w", err)
 	}
 	n, _ := result.RowsAffected()
 	if n == 0 {
+		if leaseToken != "" {
+			return ErrLeaseLost
+		}
 		return fmt.Errorf("job %s not found or not leased", id)
 	}
 	return nil
 }
 
 func (s *SQLiteStore) FailJob(id string, retry bool) error {
+	return s.failJob(id, "", retry)
+}
+
+// FailJobWithToken changes a leased job only when leaseToken still owns it.
+// Workers use this fenced form so a stale handler cannot retry a new lease.
+func (s *SQLiteStore) FailJobWithToken(id, leaseToken string, retry bool) error {
+	return s.failJob(id, leaseToken, retry)
+}
+
+func (s *SQLiteStore) failJob(id, leaseToken string, retry bool) error {
 	now := time.Now().UTC()
+	where := ` WHERE id = ? AND state = 'leased'`
+	args := []any{now.Format(sqliteTimeFormat), id}
+	if leaseToken != "" {
+		where += ` AND lease_token = ?`
+		args = append(args, leaseToken)
+	}
 	if retry {
-		_, err := s.db.Exec(
-			`UPDATE jobs SET state = 'pending', retry_count = retry_count + 1, leased_until = NULL, updated_at = ?
-			 WHERE id = ? AND state = 'leased'`,
-			now.Format(sqliteTimeFormat), id)
+		result, err := s.db.Exec(
+			`UPDATE jobs SET state = 'pending', retry_count = retry_count + 1, leased_until = NULL, lease_token = NULL, updated_at = ?`+where,
+			args...)
 		if err != nil {
 			return fmt.Errorf("retry job: %w", err)
+		}
+		if n, _ := result.RowsAffected(); n == 0 && leaseToken != "" {
+			return ErrLeaseLost
 		}
 		return nil
 	}
 	// The attempt budget is exhausted. The job moves to the dead-letter state
 	// with its final attempt count, so the event log shows the full budget.
-	_, err := s.db.Exec(
-		`UPDATE jobs SET state = 'dead_letter', retry_count = retry_count + 1, leased_until = NULL, updated_at = ?
-		 WHERE id = ? AND state = 'leased'`,
-		now.Format(sqliteTimeFormat), id)
+	result, err := s.db.Exec(
+		`UPDATE jobs SET state = 'dead_letter', retry_count = retry_count + 1, leased_until = NULL, lease_token = NULL, updated_at = ?`+where,
+		args...)
 	if err != nil {
 		return fmt.Errorf("dead-letter job: %w", err)
 	}
+	if n, _ := result.RowsAffected(); n == 0 && leaseToken != "" {
+		return ErrLeaseLost
+	}
 	return nil
+}
+
+// RenewJob extends a live lease and returns the updated job. A lease token is
+// required because a recovered job may already have a different owner.
+func (s *SQLiteStore) RenewJob(id, leaseToken string, leaseDuration time.Duration) (Job, error) {
+	now := time.Now().UTC()
+	until := now.Add(leaseDuration)
+	row := s.db.QueryRow(
+		`UPDATE jobs SET leased_until = ?, updated_at = ?
+		 WHERE id = ? AND state = 'leased' AND lease_token = ?
+		 RETURNING id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token`,
+		until.Format(sqliteTimeFormat), now.Format(sqliteTimeFormat), id, leaseToken)
+	job, err := scanJob(row)
+	if err == sql.ErrNoRows {
+		return Job{}, ErrLeaseLost
+	}
+	if err != nil {
+		return Job{}, fmt.Errorf("renew lease: %w", err)
+	}
+	return job, nil
 }
 
 // RequeueJob returns a dead-lettered job to the pending state with a fresh
@@ -339,13 +408,13 @@ func (s *SQLiteStore) RequeueJob(id string, maxAttempts int, payload *string) (J
 	if payload != nil {
 		res, err = s.db.Exec(
 			`UPDATE jobs SET state = 'pending', retry_count = 0, max_attempts = ?,
-			   payload = ?, leased_until = NULL, updated_at = ?
+			   payload = ?, leased_until = NULL, lease_token = NULL, updated_at = ?
 			 WHERE id = ? AND state = 'dead_letter'`,
 			maxAttempts, *payload, now.Format(sqliteTimeFormat), id)
 	} else {
 		res, err = s.db.Exec(
 			`UPDATE jobs SET state = 'pending', retry_count = 0, max_attempts = ?,
-			   leased_until = NULL, updated_at = ?
+			   leased_until = NULL, lease_token = NULL, updated_at = ?
 			 WHERE id = ? AND state = 'dead_letter'`,
 			maxAttempts, now.Format(sqliteTimeFormat), id)
 	}
@@ -373,7 +442,7 @@ func (s *SQLiteStore) RequeueJob(id string, maxAttempts int, payload *string) (J
 func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 	now := time.Now().UTC()
 	rows, err := s.db.Query(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token
 		 FROM jobs WHERE state = 'leased' AND leased_until < ?`,
 		now.Format(sqliteTimeFormat))
 	if err != nil {
@@ -403,7 +472,7 @@ func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 		)
 		if nextAttempt >= j.MaxAttempts {
 			res, err = s.db.Exec(
-				`UPDATE jobs SET state = 'dead_letter', retry_count = ?, leased_until = NULL, updated_at = ?
+				`UPDATE jobs SET state = 'dead_letter', retry_count = ?, leased_until = NULL, lease_token = NULL, updated_at = ?
 				 WHERE id = ? AND state = 'leased'`,
 				nextAttempt, now.Format(sqliteTimeFormat), j.ID)
 			if err != nil {
@@ -412,7 +481,7 @@ func (s *SQLiteStore) RecoverOrphanedLeases() ([]Job, error) {
 			j.State = StateDeadLetter
 		} else {
 			res, err = s.db.Exec(
-				`UPDATE jobs SET state = 'pending', retry_count = ?, leased_until = NULL, updated_at = ?
+				`UPDATE jobs SET state = 'pending', retry_count = ?, leased_until = NULL, lease_token = NULL, updated_at = ?
 				 WHERE id = ? AND state = 'leased'`,
 				nextAttempt, now.Format(sqliteTimeFormat), j.ID)
 			if err != nil {
@@ -533,7 +602,7 @@ type JobFilter struct {
 // web dashboard use this method to render paginated, filtered views.
 func (s *SQLiteStore) SearchJobs(f JobFilter) ([]Job, error) {
 	where, args := buildJobFilter(f)
-	query := `SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+	query := `SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token
 		 FROM jobs ` + where + ` ORDER BY created_at DESC, id ASC`
 	if f.Limit > 0 {
 		query += ` LIMIT ?`
@@ -636,7 +705,7 @@ func buildHistoryFilter(f HistoryFilter) (string, []any) {
 
 func (s *SQLiteStore) queryJobs(where string, args ...any) ([]Job, error) {
 	rows, err := s.db.Query(
-		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at
+		`SELECT id, kind, payload, state, retry_count, max_attempts, priority, idempotency_key, created_at, updated_at, leased_until, run_at, lease_token
 		 FROM jobs `+where, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query jobs: %w", err)
@@ -882,9 +951,9 @@ type scannable interface {
 func scanJob(row scannable) (Job, error) {
 	var j Job
 	var stateStr, createdAt, updatedAt string
-	var ik, lu, ra sql.NullString
+	var ik, lu, ra, lt sql.NullString
 	err := row.Scan(&j.ID, &j.Kind, &j.Payload, &stateStr, &j.RetryCount, &j.MaxAttempts,
-		&j.Priority, &ik, &createdAt, &updatedAt, &lu, &ra)
+		&j.Priority, &ik, &createdAt, &updatedAt, &lu, &ra, &lt)
 	if err != nil {
 		return Job{}, err
 	}
@@ -911,6 +980,9 @@ func scanJob(row scannable) (Job, error) {
 			return Job{}, fmt.Errorf("parse run_at: %w", err)
 		}
 		j.RunAt = &t
+	}
+	if lt.Valid {
+		j.LeaseToken = lt.String
 	}
 	return j, nil
 }

@@ -27,6 +27,9 @@ type Job struct {
 	CreatedAt      time.Time  `json:"created_at"`
 	UpdatedAt      time.Time  `json:"updated_at"`
 	LeasedUntil    *time.Time `json:"leased_until,omitempty"`
+	// LeaseToken fences updates from a worker that lost its lease. It stays out
+	// of JSON responses because callers should not persist or expose it.
+	LeaseToken string `json:"-"`
 	// RunAt is the earliest time the job may be leased. When nil, the job is
 	// ready as soon as it is pending. The field is stored as RFC3339 UTC.
 	RunAt *time.Time `json:"run_at,omitempty"`
@@ -44,6 +47,7 @@ const (
 	EventRecovered    EventType = "recovered"
 	EventDeadLettered EventType = "dead_lettered"
 	EventRequeued     EventType = "requeued"
+	EventLeaseRenewed EventType = "lease_renewed"
 )
 
 type Event struct {

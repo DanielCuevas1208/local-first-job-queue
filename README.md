@@ -18,6 +18,8 @@ The dashboard can require HTTP Basic credentials for shared deployments.
 
 It exports current job snapshots and retained event histories as JSON Lines.
 
+Workers renew long-running leases with fencing tokens.
+
 ## Value
 
 Use this project to study queue behavior without an external service.
@@ -55,6 +57,12 @@ Each transition appends an event with a timestamp and optional metadata.
 A lease claim runs as one atomic write.
 
 Several worker processes can share one SQLite file without double-leasing a job.
+
+Each lease carries a random fencing token.
+
+The worker renews that lease before its deadline.
+
+The token blocks stale workers from changing a recovered lease.
 
 ## Setup
 
@@ -156,7 +164,7 @@ jobqueue enqueue -kind <type> -payload <json> [-priority <n>] [-idempotency-key 
 ### `work`
 
 ```text
-jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-poll <duration>] [-aging <duration>] [-retention-age <duration>] [-retention-max-events <n>] [-retention-interval <duration>] [-metrics-addr <addr>] [-web-addr <addr>] [-web-user <name>] [-web-pass <password>] [-db <path>]
+jobqueue work -kind <type> [-concurrency <n>] [-lease <duration>] [-lease-renewal <duration>] [-poll <duration>] [-aging <duration>] [-retention-age <duration>] [-retention-max-events <n>] [-retention-interval <duration>] [-metrics-addr <addr>] [-web-addr <addr>] [-web-user <name>] [-web-pass <password>] [-db <path>]
 ```
 
 The worker recovers expired leases when it starts.
@@ -182,6 +190,10 @@ Use `-metrics-addr` to serve Prometheus metrics beside the worker.
 Use `-web-addr` to serve the web dashboard beside the worker.
 
 Use `-web-user` and `-web-pass` to require credentials for that dashboard.
+
+Use `-lease-renewal` to set the heartbeat interval.
+
+The default heartbeat runs every one-third of the lease duration.
 
 ### `inspect`
 
@@ -337,6 +349,24 @@ An expired lease becomes recoverable.
 
 One atomic statement claims a lease, so shared-file workers stay safe.
 
+### Lease renewal
+
+The worker renews a live lease while its handler runs.
+
+The default heartbeat runs every one-third of the lease duration.
+
+Use `-lease-renewal` to set a different heartbeat interval.
+
+Each claim gets a fencing token.
+
+Renewal, acknowledgement, and retry require that token.
+
+A recovered job gets a new token.
+
+An old worker cannot extend or finish the new lease.
+
+Each successful renewal appends a `lease_renewed` event with its new deadline.
+
 ### Priority dispatch
 
 Ready jobs with higher priority values lease first.
@@ -460,6 +490,8 @@ The exporter reports eight metric families.
 The last-run gauge is absent until the first retention run.
 
 Every known state and event type appears with an explicit zero.
+
+Lease renewals appear in the event counter as `lease_renewed`.
 
 The output order stays stable across scrapes.
 
@@ -627,6 +659,13 @@ starting worker again; it will process the requeued job.
 
 queue drained before the run deadline.
 
+Lease renewal
+-------------
+a handler runs for 220ms with a 75ms lease and a 15ms heartbeat.
+  after 120ms: state=leased lease_renewals=<n>
+  completed after 220ms; total lease_renewed events=<n>
+the fenced worker kept ownership until acknowledgement.
+
 Priority aging
 --------------
 aging interval: 100ms; a job gains one priority point per interval it waits.
@@ -678,6 +717,7 @@ jobqueue_jobs{state="failed"} 0
 # HELP jobqueue_events_total Number of events per event type.
 # TYPE jobqueue_events_total counter
 jobqueue_events_total{type="enqueued"} 5
+jobqueue_events_total{type="lease_renewed"} 0
 jobqueue_events_total{type="retried"} 5
 jobqueue_events_total{type="dead_lettered"} 1
 jobqueue_events_total{type="requeued"} 1
@@ -791,7 +831,7 @@ Run queue benchmarks with this command.
 go test ./internal/queue -run '^$' -bench Benchmark -benchmem -count=1
 ```
 
-Verification status: local tests, vet, build, and benchmarks pass.
+Verification status: module verification, local tests, vet, build, and benchmarks pass.
 
 CI runs the same checks on Ubuntu with the race detector.
 
@@ -804,6 +844,8 @@ The shared-file tests cover multi-process leases, recovery, and worker scaling.
 The retention tests cover the age limit, the event cap, and idempotent runs.
 
 The worker tests cover scheduled auto-retention beside normal processing.
+
+The lease tests cover deadline extension, fencing, and long-running handlers.
 
 ## Limitations
 
@@ -833,6 +875,8 @@ Basic Auth sends the password in clear text without TLS.
 
 Add a reverse proxy with HTTPS for any shared deployment.
 
+Handlers must honor context cancellation when a worker loses its lease.
+
 ## Roadmap
 
 - [x] Durable leases, retries, idempotency, crash recovery, and event history.
@@ -849,8 +893,22 @@ Add a reverse proxy with HTTPS for any shared deployment.
 - [x] Report retention activity in metrics and the dashboard.
 - [x] Browser requeue for dead-lettered jobs.
 - [x] Event history export for archival workflows.
+- [x] Fenced lease renewal for handlers that outlive the initial lease.
+- [ ] Restore and verify exported histories without changing live queue state.
 
 ### Release notes
+
+This release adds fenced lease renewal for long-running handlers.
+
+Workers renew leases every one-third of the lease duration by default.
+
+The `-lease-renewal` flag sets a custom heartbeat interval.
+
+Each lease receives a random token.
+
+Renewal, acknowledgement, and retry reject stale tokens.
+
+The demo shows a handler that runs past its initial lease.
 
 This release adds versioned JSON Lines export for archival workflows.
 

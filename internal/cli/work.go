@@ -25,6 +25,13 @@ func (echoHandler) Handle(ctx context.Context, job queue.Job) error {
 	return nil
 }
 
+func renewalDescription(lease, configured time.Duration) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+	return lease / 3
+}
+
 // Work starts a worker process for one job kind. On startup it recovers
 // orphaned leases left by previous workers. A payload may carry a "fault"
 // object; the fault injector honors it so a real worker run can reproduce
@@ -37,6 +44,7 @@ func Work(args []string) error {
 	dbPath := fs.String("db", "queue.db", "database path")
 	concurrency := fs.Int("concurrency", 1, "number of concurrent workers")
 	leaseDuration := fs.Duration("lease", 30*time.Second, "lease duration per job")
+	leaseRenewal := fs.Duration("lease-renewal", 0, "lease heartbeat interval (0 uses one-third of the lease)")
 	pollInterval := fs.Duration("poll", time.Second, "time between lease attempts")
 	aging := fs.Duration("aging", queue.DefaultAgingInterval, "priority aging interval; a job gains one priority point per interval it waits (0 disables)")
 	metricsAddr := fs.String("metrics-addr", "", "address to serve Prometheus metrics on, e.g. :9090 (empty disables)")
@@ -59,6 +67,7 @@ func Work(args []string) error {
 	opts := []worker.WorkerOption{
 		worker.WithConcurrency(*concurrency),
 		worker.WithLeaseDuration(*leaseDuration),
+		worker.WithLeaseRenewalInterval(*leaseRenewal),
 		worker.WithPollInterval(*pollInterval),
 	}
 	retentionEnabled := *retentionAge > 0 || *retentionMaxEvents > 0
@@ -101,8 +110,8 @@ func Work(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("worker started kind=%q concurrency=%d lease=%s poll=%s aging=%s",
-		*kind, *concurrency, *leaseDuration, *pollInterval, *aging)
+	log.Printf("worker started kind=%q concurrency=%d lease=%s renewal=%s poll=%s aging=%s",
+		*kind, *concurrency, *leaseDuration, renewalDescription(*leaseDuration, *leaseRenewal), *pollInterval, *aging)
 	if retentionEnabled {
 		log.Printf("auto-retention enabled: age=%s max_events=%d interval=%s",
 			*retentionAge, *retentionMaxEvents, *retentionInterval)

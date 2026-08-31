@@ -28,6 +28,7 @@ var eventTypeOrder = []queue.EventType{
 	queue.EventEnqueued,
 	queue.EventScheduled,
 	queue.EventLeased,
+	queue.EventLeaseRenewed,
 	queue.EventAcknowledged,
 	queue.EventFailed,
 	queue.EventRetried,

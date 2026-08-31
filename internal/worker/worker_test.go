@@ -511,3 +511,82 @@ func TestWorkerRetentionOffByDefault(t *testing.T) {
 		t.Errorf("expected the old job to stay when auto-retention is off: %v", err)
 	}
 }
+
+// TestWorkerRenewsLongHandlerLease verifies that a handler may outlive its
+// initial lease while the worker keeps ownership alive with heartbeats.
+func TestWorkerRenewsLongHandlerLease(t *testing.T) {
+	q, s := newTestQueue(t)
+	job, err := q.Enqueue("test", "{}")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var processed atomic.Int32
+	handler := func(ctx context.Context, got queue.Job) error {
+		once.Do(func() { close(started) })
+		select {
+		case <-release:
+			processed.Add(1)
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	w := NewWorker(q, handler, "test",
+		WithPollInterval(time.Millisecond),
+		WithLeaseDuration(100*time.Millisecond),
+		WithLeaseRenewalInterval(10*time.Millisecond),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = w.Run(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not start")
+	}
+	time.Sleep(220 * time.Millisecond)
+	leased, err := s.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("get leased job: %v", err)
+	}
+	if leased.State != queue.StateLeased {
+		t.Fatalf("long handler state = %s, want leased", leased.State)
+	}
+	if leased.LeasedUntil == nil || !leased.LeasedUntil.After(time.Now().UTC()) {
+		t.Fatalf("heartbeat did not extend lease: %+v", leased.LeasedUntil)
+	}
+
+	close(release)
+	waitFor(t, func() bool {
+		got, err := s.GetJob(job.ID)
+		return err == nil && got.State == queue.StateCompleted
+	}, time.Second)
+	if processed.Load() != 1 {
+		t.Fatalf("handler processed %d times, want once", processed.Load())
+	}
+	events, err := s.GetJobEvents(job.ID)
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	renewals := 0
+	for _, event := range events {
+		if event.EventType == queue.EventLeaseRenewed {
+			renewals++
+		}
+	}
+	if renewals < 2 {
+		t.Fatalf("recorded %d lease renewals, want at least 2", renewals)
+	}
+}
