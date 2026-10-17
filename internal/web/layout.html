@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>{{template "title" .}} · Local-first Job Queue</title>
+<style>
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --text: #17181c;
+  --muted: #69717d;
+  --border: #e3e6ea;
+  --info: #2563eb;
+  --ok: #15803d;
+  --warn: #b45309;
+  --bad: #b91c1c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101318;
+    --card: #181c23;
+    --text: #e8eaed;
+    --muted: #9aa3af;
+    --border: #2a303a;
+    --info: #60a5fa;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+.top { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 0; margin-bottom: 26px; }
+.brand { font-size: 19px; font-weight: 700; color: var(--text); text-decoration: none; }
+.brand small { color: var(--muted); font-weight: 500; font-size: 13px; margin-left: 8px; }
+main.wrap h1 { font-size: 22px; margin: 0 0 18px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 24px; }
+.stat { background: var(--card); border: 1px solid var(--border); border-top: 4px solid var(--muted);
+  border-radius: 10px; padding: 16px; }
+.stat .num { font-size: 28px; font-weight: 700; line-height: 1.1; }
+.stat .lbl { color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: .05em; margin-top: 4px; }
+.stat.pending { border-top-color: var(--info); }
+.stat.leased { border-top-color: var(--warn); }
+.stat.completed { border-top-color: var(--ok); }
+.stat.dead { border-top-color: var(--bad); }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px 18px 6px; margin-bottom: 24px; }
+.card h2 { margin: 0 0 12px; font-size: 15px; }
+.card > p { margin: 0 0 12px; color: var(--muted); }
+table { width: 100%; border-collapse: collapse; margin-bottom: 12px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13.5px; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px;
+  font-size: 12.5px; word-break: break-all; }
+pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px;
+  overflow-x: auto; margin: 0 0 12px; }
+pre code { border: none; background: none; padding: 0; word-break: normal; }
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.badge.pending { background: rgba(37, 99, 235, .12); color: var(--info); }
+.badge.leased { background: rgba(180, 83, 9, .12); color: var(--warn); }
+.badge.completed { background: rgba(21, 128, 61, .12); color: var(--ok); }
+.badge.dead { background: rgba(185, 28, 28, .12); color: var(--bad); }
+.badge.event { background: var(--bg); border: 1px solid var(--border); color: var(--text); }
+.kv th { width: 190px; }
+.muted { color: var(--muted); }
+footer { color: var(--muted); font-size: 12.5px; padding: 8px 0 32px; }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="/">Local-first Job Queue<small>read-only inspection dashboard</small></a>
+  </div>
+</header>
+<main class="wrap">
+{{template "content" .}}
+</main>
+<footer class="wrap">Generated {{fmtTime .GeneratedAt}} UTC · SQLite-backed queue</footer>
+</body>
+</html>

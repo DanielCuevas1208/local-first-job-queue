@@ -48,7 +48,7 @@ func RenderSnapshot(snap *queue.QueueSnapshot, w io.Writer) {
 	} else {
 		for _, s := range []queue.JobState{
 			queue.StatePending, queue.StateLeased,
-			queue.StateCompleted, queue.StateFailed,
+			queue.StateCompleted, queue.StateDeadLetter, queue.StateFailed,
 		} {
 			if c, ok := snap.Stats[s]; ok {
 				fmt.Fprintf(w, "  %s: %d\n", s, c)
