@@ -21,9 +21,11 @@ Commands:
   inspect  View queue state and event log
   history  View the event log for one job
   requeue  Return a dead-lettered job to the queue
+  prune    Apply retention policy to the queue
+  export   Write job histories as JSON Lines
   seed     Load bundled sample data
   metrics  Expose queue state for Prometheus
-  web      Serve a read-only HTML dashboard
+  web      Serve the queue dashboard and requeue dead letters
   demo     Run a self-contained scenario with fault injection
 
 Use <command> -help for command flags.`)
@@ -45,6 +47,10 @@ Use <command> -help for command flags.`)
 		err = cli.History(args)
 	case "requeue":
 		err = cli.Requeue(args)
+	case "prune":
+		err = cli.Prune(args)
+	case "export":
+		err = cli.Export(args)
 	case "seed":
 		err = cli.Seed(args)
 	case "metrics":

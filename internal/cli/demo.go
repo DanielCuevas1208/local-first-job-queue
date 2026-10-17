@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/local-first-job-queue/internal/fault"
@@ -187,7 +188,16 @@ func Demo(args []string) error {
 		fmt.Println("reached the run deadline before the queue drained.")
 	}
 
+	if err := showLeaseRenewal(*kind); err != nil {
+		return err
+	}
 	if err := showPriorityAging(*kind); err != nil {
+		return err
+	}
+	if err := showRetention(*kind); err != nil {
+		return err
+	}
+	if err := showAutoRetention(*kind); err != nil {
 		return err
 	}
 
@@ -208,8 +218,111 @@ func Demo(args []string) error {
 	fmt.Printf("\ninspect again with: jobqueue inspect -db %q\n", path)
 	fmt.Printf("inspect a job with: jobqueue history <id> -db %q\n", path)
 	fmt.Printf("requeue a dead letter with: jobqueue requeue <id> -db %q\n", path)
-	fmt.Printf("view in a browser with: jobqueue web -db %q\n", path)
+	fmt.Printf("prune old jobs with: jobqueue prune -age 168h -db %q\n", path)
+	fmt.Printf("view it in a browser with: jobqueue web -db %q\n", path)
 	return nil
+}
+
+// showLeaseRenewal demonstrates that a handler may run longer than its
+// initial lease. The worker renews the lease with a fenced token until the
+// handler completes, so recovery cannot hand the job to another worker.
+func showLeaseRenewal(kind string) error {
+	const (
+		leaseDuration = 75 * time.Millisecond
+		renewalEvery  = 15 * time.Millisecond
+		handlerTime   = 220 * time.Millisecond
+	)
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-lease-renewal?mode=memory&cache=shared")
+	if err != nil {
+		return fmt.Errorf("open lease renewal store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+	job, err := q.Enqueue(kind, "{}")
+	if err != nil {
+		return fmt.Errorf("enqueue lease renewal: %w", err)
+	}
+
+	started := make(chan struct{})
+	var once sync.Once
+	handler := func(ctx context.Context, _ queue.Job) error {
+		once.Do(func() { close(started) })
+		timer := time.NewTimer(handlerTime)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	w := worker.NewWorker(q, handler, kind,
+		worker.WithPollInterval(time.Millisecond),
+		worker.WithLeaseDuration(leaseDuration),
+		worker.WithLeaseRenewalInterval(renewalEvery),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	done := make(chan error, 1)
+	go func() { done <- w.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		return fmt.Errorf("lease renewal demo handler did not start")
+	}
+	time.Sleep(120 * time.Millisecond)
+	mid, err := store.GetJob(job.ID)
+	if err != nil {
+		cancel()
+		<-done
+		return fmt.Errorf("inspect renewed lease: %w", err)
+	}
+	renewals, err := countEvents(store, queue.EventLeaseRenewed)
+	if err != nil {
+		cancel()
+		<-done
+		return fmt.Errorf("count lease renewals: %w", err)
+	}
+	fmt.Println("\nLease renewal")
+	fmt.Println("-------------")
+	fmt.Printf("a handler runs for %s with a %s lease and a %s heartbeat.\n", handlerTime, leaseDuration, renewalEvery)
+	fmt.Printf("  after 120ms: state=%s lease_renewals=%d\n", mid.State, renewals)
+	deadline := time.Now().Add(time.Second)
+	for mid.State != queue.StateCompleted && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		mid, err = store.GetJob(job.ID)
+		if err != nil {
+			cancel()
+			<-done
+			return fmt.Errorf("wait for renewed job: %w", err)
+		}
+	}
+	cancel()
+	<-done
+	if mid.State != queue.StateCompleted {
+		return fmt.Errorf("lease renewal demo ended in %s", mid.State)
+	}
+	finalRenewals, err := countEvents(store, queue.EventLeaseRenewed)
+	if err != nil {
+		return fmt.Errorf("count final lease renewals: %w", err)
+	}
+	fmt.Printf("  completed after %s; total lease_renewed events=%d\n", handlerTime, finalRenewals)
+	fmt.Println("the fenced worker kept ownership until acknowledgement.")
+	return nil
+}
+
+func countEvents(store *queue.SQLiteStore, eventType queue.EventType) (int, error) {
+	counts, err := store.GetEventTypeCounts()
+	if err != nil {
+		return 0, err
+	}
+	for _, count := range counts {
+		if count.EventType == eventType {
+			return count.Count, nil
+		}
+	}
+	return 0, nil
 }
 
 // showPriorityAging demonstrates that a job gains one priority point per aging
@@ -267,6 +380,174 @@ func showPriorityAging(kind string) error {
 		shortID(first.ID), payloadName(first.Payload), shortID(second.ID), payloadName(second.Payload))
 	fmt.Println("the waiting job outranks the fresher higher-priority job.")
 	return nil
+}
+
+// showRetention demonstrates that a retention run removes old terminal jobs
+// together with their events. Three jobs complete; two of them are backdated
+// beyond the retention age. A prune run deletes the two old jobs and their
+// event rows, so the store keeps only recent work.
+func showRetention(kind string) error {
+	const maxAge = time.Hour
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-retention?mode=memory&cache=shared")
+	if err != nil {
+		return fmt.Errorf("open retention store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+	ctx := context.Background()
+
+	fmt.Println("\nRetention")
+	fmt.Println("---------")
+	fmt.Printf("retention age: %s; terminal jobs older than that leave with their events.\n", maxAge)
+
+	oldIDs := []string{}
+	for i := 0; i < 3; i++ {
+		job, err := q.Enqueue(kind, fmt.Sprintf(`{"name":"retention-%d"}`, i+1))
+		if err != nil {
+			return fmt.Errorf("enqueue retention: %w", err)
+		}
+		leased, err := q.Lease(ctx, kind, time.Minute)
+		if err != nil || leased == nil || leased.ID != job.ID {
+			return fmt.Errorf("lease retention job: %v %v", leased, err)
+		}
+		if err := q.Acknowledge(job.ID); err != nil {
+			return fmt.Errorf("ack retention job: %w", err)
+		}
+		if i < 2 {
+			oldIDs = append(oldIDs, job.ID)
+		}
+	}
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	for _, id := range oldIDs {
+		if _, err := store.DB().Exec(
+			`UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			cutoff.Format(time.RFC3339Nano), id); err != nil {
+			return fmt.Errorf("age retention job: %w", err)
+		}
+	}
+
+	completed, totalEvents := retentionCounts(store)
+	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
+
+	res, err := q.Prune(queue.PrunePolicy{MaxJobAge: maxAge})
+	if err != nil {
+		return fmt.Errorf("prune retention: %w", err)
+	}
+	completed, totalEvents = retentionCounts(store)
+	fmt.Printf("  prune removed %d job(s) and %d event(s)\n", res.JobsRemoved, res.EventsRemoved)
+	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
+	activity, err := retentionActivity(store, queue.RetentionSourceManual)
+	if err != nil {
+		return fmt.Errorf("read manual retention activity: %w", err)
+	}
+	fmt.Printf("  activity: source=%s runs=%d jobs_removed=%d events_removed=%d\n", activity.Source, activity.Runs, activity.JobsRemoved, activity.EventsRemoved)
+	fmt.Println("the fresh job kept its events; old terminal jobs left with theirs.")
+	return nil
+}
+
+// showAutoRetention demonstrates that a worker applies a retention policy on a
+// schedule, with no external prune run. Two completed jobs are backdated beyond
+// the retention age. A worker with a short interval removes them by itself
+// while it keeps running.
+func showAutoRetention(kind string) error {
+	const maxAge = time.Hour
+	const interval = 50 * time.Millisecond
+	store, err := queue.NewSQLiteStore("file:jobqueue-demo-auto-retention?mode=memory&cache=shared")
+	if err != nil {
+		return fmt.Errorf("open auto-retention store: %w", err)
+	}
+	defer store.Close()
+	q := queue.NewQueue(store)
+	ctx := context.Background()
+
+	fmt.Println("\nAuto-retention")
+	fmt.Println("-------------")
+	fmt.Printf("a worker with age=%s prunes every %s; no external job is needed.\n", maxAge, interval)
+
+	oldIDs := []string{}
+	for i := 0; i < 3; i++ {
+		job, err := q.Enqueue(kind, fmt.Sprintf(`{"name":"auto-%d"}`, i+1))
+		if err != nil {
+			return fmt.Errorf("enqueue auto-retention: %w", err)
+		}
+		leased, err := q.Lease(ctx, kind, time.Minute)
+		if err != nil || leased == nil || leased.ID != job.ID {
+			return fmt.Errorf("lease auto-retention job: %v %v", leased, err)
+		}
+		if err := q.Acknowledge(job.ID); err != nil {
+			return fmt.Errorf("ack auto-retention job: %w", err)
+		}
+		if i < 2 {
+			oldIDs = append(oldIDs, job.ID)
+		}
+	}
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	for _, id := range oldIDs {
+		if _, err := store.DB().Exec(
+			`UPDATE jobs SET updated_at = ? WHERE id = ?`,
+			cutoff.Format(time.RFC3339Nano), id); err != nil {
+			return fmt.Errorf("age auto-retention job: %w", err)
+		}
+	}
+
+	completed, totalEvents := retentionCounts(store)
+	fmt.Printf("  completed: %d  events: %d\n", completed, totalEvents)
+
+	w := worker.NewWorker(q, func(context.Context, queue.Job) error { return nil }, kind,
+		worker.WithPollInterval(10*time.Millisecond),
+		worker.WithLeaseDuration(time.Minute),
+		worker.WithRetention(queue.PrunePolicy{MaxJobAge: maxAge}, interval),
+	)
+	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- w.Run(runCtx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for completed != 1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		completed, totalEvents = retentionCounts(store)
+	}
+	cancel()
+	<-done
+
+	fmt.Printf("  worker removed the old jobs: completed: %d  events: %d\n", completed, totalEvents)
+	activity, err := retentionActivity(store, queue.RetentionSourceAuto)
+	if err != nil {
+		return fmt.Errorf("read automatic retention activity: %w", err)
+	}
+	fmt.Printf("  activity: source=%s runs=%d jobs_removed=%d events_removed=%d\n", activity.Source, activity.Runs, activity.JobsRemoved, activity.EventsRemoved)
+	fmt.Println("the worker keeps the store small while it processes work.")
+	return nil
+}
+
+// retentionCounts reports the completed-job count and the total event rows of
+// a store, so the retention segment can show the before and after state.
+func retentionCounts(store *queue.SQLiteStore) (completed, events int) {
+	if stats, err := store.GetQueueStats(); err == nil {
+		completed = stats[queue.StateCompleted]
+	}
+	if counts, err := store.GetEventTypeCounts(); err == nil {
+		for _, c := range counts {
+			events += c.Count
+		}
+	}
+	return completed, events
+}
+
+// retentionActivity returns the aggregate for one retention source. The demo
+// uses it to show that every manual and automatic pass is observable.
+func retentionActivity(store *queue.SQLiteStore, source queue.RetentionSource) (queue.RetentionSourceCount, error) {
+	stats, err := store.GetRetentionStats()
+	if err != nil {
+		return queue.RetentionSourceCount{}, err
+	}
+	for _, stat := range stats {
+		if stat.Source == source {
+			return stat, nil
+		}
+	}
+	return queue.RetentionSourceCount{Source: source}, nil
 }
 
 func shortID(id string) string {

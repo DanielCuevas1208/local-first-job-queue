@@ -138,6 +138,47 @@ func TestOldestPendingAgeIsDeterministic(t *testing.T) {
 	}
 }
 
+// TestRetentionMetricsReportSourcesAndAge verifies that scrapes expose manual
+// and automatic activity with stable labels and a deterministic last-run age.
+func TestRetentionMetricsReportSourcesAndAge(t *testing.T) {
+	s, q := newTestStore(t)
+	job, err := q.Enqueue("test", `{}`)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	leased, err := q.Lease(context.Background(), "test", time.Minute)
+	if err != nil || leased == nil || leased.ID != job.ID {
+		t.Fatalf("lease: %v %v", leased, err)
+	}
+	if err := q.Acknowledge(job.ID); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if _, err := q.Prune(queue.PrunePolicy{MaxEventsPerJob: 1}); err != nil {
+		t.Fatalf("manual prune: %v", err)
+	}
+	if _, err := q.PruneAuto(queue.PrunePolicy{MaxEventsPerJob: 1}); err != nil {
+		t.Fatalf("automatic prune: %v", err)
+	}
+
+	last, err := s.GetLastRetentionRun()
+	if err != nil || last == nil {
+		t.Fatalf("last retention run: %v %v", last, err)
+	}
+	col := New(s, WithNow(func() time.Time { return last.StartedAt.Add(7 * time.Second) }))
+	got := render(t, col)
+	for _, want := range []string{
+		`jobqueue_retention_runs_total{source="manual"} 1`,
+		`jobqueue_retention_runs_total{source="auto"} 1`,
+		`jobqueue_retention_events_removed_total{source="manual"} 2`,
+		`jobqueue_retention_events_removed_total{source="auto"} 0`,
+		"jobqueue_retention_last_run_seconds 7",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("metrics missing %q in:\n%s", want, got)
+		}
+	}
+}
+
 // TestHandlerScrapes verifies that the HTTP handler serves the exposition
 // format on /metrics and a short landing page at the root.
 func TestHandlerScrapes(t *testing.T) {

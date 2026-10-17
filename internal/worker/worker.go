@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -13,17 +14,26 @@ import (
 type JobHandler func(ctx context.Context, job queue.Job) error
 
 type Worker struct {
-	queue         *queue.Queue
-	handler       JobHandler
-	pollInterval  time.Duration
-	leaseDuration time.Duration
-	kind          string
-	concurrency   int
+	queue                *queue.Queue
+	handler              JobHandler
+	pollInterval         time.Duration
+	leaseDuration        time.Duration
+	leaseRenewalInterval time.Duration
+	kind                 string
+	concurrency          int
+	retention            *retentionSpec
 
 	mu      sync.Mutex
 	wg      sync.WaitGroup
 	cancel  context.CancelFunc
 	running bool
+}
+
+// retentionSpec holds the policy and cadence of the automatic retention runs
+// that a worker performs beside its job loop.
+type retentionSpec struct {
+	policy   queue.PrunePolicy
+	interval time.Duration
 }
 
 type WorkerOption func(*Worker)
@@ -40,9 +50,30 @@ func WithLeaseDuration(d time.Duration) WorkerOption {
 	}
 }
 
+// WithLeaseRenewalInterval changes how often a running job renews its lease.
+// A non-positive value derives an interval of one-third of the lease duration.
+func WithLeaseRenewalInterval(d time.Duration) WorkerOption {
+	return func(w *Worker) {
+		w.leaseRenewalInterval = d
+	}
+}
+
 func WithConcurrency(n int) WorkerOption {
 	return func(w *Worker) {
 		w.concurrency = n
+	}
+}
+
+// WithRetention enables scheduled auto-retention in the worker. The worker
+// applies policy to the shared store once at startup and then on every
+// interval, removing old terminal jobs and capping the event log while it
+// continues to process work. A zero policy removes nothing, so an operator can
+// configure the loop before choosing limits. Prune is transactional and
+// idempotent, so several workers that run the same policy stay safe on one
+// file.
+func WithRetention(policy queue.PrunePolicy, interval time.Duration) WorkerOption {
+	return func(w *Worker) {
+		w.retention = &retentionSpec{policy: policy, interval: interval}
 	}
 }
 
@@ -83,6 +114,14 @@ func (w *Worker) Run(ctx context.Context) error {
 		sem <- struct{}{}
 	}
 
+	if w.retention != nil {
+		w.wg.Add(1)
+		go func() {
+			defer w.wg.Done()
+			w.retentionLoop(ctx)
+		}()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -118,21 +157,70 @@ func (w *Worker) processOne(ctx context.Context) {
 		return
 	}
 
-	runCtx, cancel := context.WithTimeout(ctx, w.leaseDuration)
-	defer cancel()
+	runCtx, cancel := context.WithCancel(ctx)
+	renewDone, renewErr := w.startLeaseRenewal(runCtx, cancel, *job)
 
 	err = w.runHandler(runCtx, *job)
+	cancel()
+	if renewDone != nil {
+		<-renewDone
+	}
+	select {
+	case leaseErr := <-renewErr:
+		if errors.Is(leaseErr, queue.ErrLeaseLost) {
+			log.Printf("lease lost for job %s; handler stopped", job.ID)
+		} else {
+			log.Printf("lease renewal stopped job %s: %v", job.ID, leaseErr)
+		}
+		return
+	default:
+	}
 	if err != nil {
 		log.Printf("job %s failed: %v", job.ID, err)
-		if ackErr := w.queue.Fail(job.ID, err.Error()); ackErr != nil {
+		if ackErr := w.queue.FailLease(job.ID, job.LeaseToken, err.Error()); ackErr != nil {
 			log.Printf("fail error for %s: %v", job.ID, ackErr)
 		}
 		return
 	}
 
-	if err := w.queue.Acknowledge(job.ID); err != nil {
+	if err := w.queue.AcknowledgeLease(job.ID, job.LeaseToken); err != nil {
 		log.Printf("ack error for %s: %v", job.ID, err)
 	}
+}
+
+// startLeaseRenewal starts a heartbeat for one leased job. A failed renewal
+// cancels the handler so it cannot finish work after another worker takes the
+// lease. The caller waits for the goroutine before acknowledging or retrying.
+func (w *Worker) startLeaseRenewal(ctx context.Context, cancel context.CancelFunc, job queue.Job) (<-chan struct{}, <-chan error) {
+	interval := w.leaseRenewalInterval
+	if interval <= 0 {
+		interval = w.leaseDuration / 3
+	}
+	if interval <= 0 || job.LeaseToken == "" {
+		return nil, nil
+	}
+
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(done)
+		timer := time.NewTimer(interval)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				if _, err := w.queue.Renew(job.ID, job.LeaseToken, w.leaseDuration); err != nil {
+					errCh <- err
+					cancel()
+					return
+				}
+				timer.Reset(interval)
+			}
+		}
+	}()
+	return done, errCh
 }
 
 // runHandler invokes the handler and converts a panic into an error. This keeps
@@ -144,6 +232,44 @@ func (w *Worker) runHandler(ctx context.Context, job queue.Job) (err error) {
 		}
 	}()
 	return w.handler(ctx, job)
+}
+
+// retentionLoop applies the retention policy once at startup and then on a
+// fixed interval until the worker context ends. The store serializes writers,
+// so a prune transaction never interleaves with a lease claim or another
+// worker's retention run.
+func (w *Worker) retentionLoop(ctx context.Context) {
+	w.runRetention()
+	interval := w.retention.interval
+	if interval <= 0 {
+		return
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			w.runRetention()
+			timer.Reset(interval)
+		}
+	}
+}
+
+// runRetention performs one prune pass and reports what it removed. The run is
+// recorded as automatic retention, so metrics and the dashboard show it beside
+// manual prune commands. Errors are logged and skipped, so a transient store
+// failure does not stop the worker.
+func (w *Worker) runRetention() {
+	res, err := w.queue.PruneAuto(w.retention.policy)
+	if err != nil {
+		log.Printf("auto-retention: %v", err)
+		return
+	}
+	if res.JobsRemoved > 0 || res.EventsRemoved > 0 {
+		log.Printf("auto-retention: removed %d job(s) and %d event(s)", res.JobsRemoved, res.EventsRemoved)
+	}
 }
 
 func (w *Worker) Stop() {

@@ -23,6 +23,7 @@ Thumbs.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.jsonl
 
 # Temp files
 /tmp/
