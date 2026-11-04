@@ -546,7 +546,9 @@ type HistoryFilter struct {
 // current jobs only; retention may already have removed older terminal jobs.
 func (s *SQLiteStore) GetJobHistories(f HistoryFilter) ([]JobHistory, error) {
 	where, args := buildHistoryFilter(f)
-	jobs, err := s.queryJobs(where+` ORDER BY created_at ASC, id ASC`, args...)
+	// SQLite timestamps can share a value when enqueues happen within one
+	// clock tick. The first event preserves insertion order for that tie.
+	jobs, err := s.queryJobs(where+` ORDER BY created_at ASC, (SELECT MIN(e.id) FROM events AS e WHERE e.job_id = jobs.id) ASC, id ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query history jobs: %w", err)
 	}

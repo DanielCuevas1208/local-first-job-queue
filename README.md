@@ -38,6 +38,7 @@ The queue separates durable state from worker execution.
 - `internal/cli` renders commands, snapshots, history, archives, and the demo.
 - `internal/metrics` renders queue state in the Prometheus text format.
 - `internal/fixture` provides repeatable sample workloads.
+- `internal/archive` verifies exported histories in memory.
 - `internal/web` serves a browser dashboard, requeue action, and small JSON API.
 
 A retention run removes old terminal jobs in one transaction.
@@ -66,7 +67,7 @@ The token blocks stale workers from changing a recovered lease.
 
 ## Setup
 
-Requires Go 1.25.
+Requires Go 1.26.
 
 Run these commands from the repository root.
 
@@ -147,7 +148,12 @@ Export job histories before pruning when an archive must include old terminal wo
 
 ```text
 go run . export -db queue.db -out history.jsonl
+go run . verify -in history.jsonl
 ```
+
+The `verify` command reads the archive into memory.
+
+It does not open the live queue database.
 
 ## Commands
 
@@ -232,6 +238,20 @@ Use `-kind` or `-state` to narrow the archive.
 ```text
 jobqueue export -db queue.db -kind email -state completed -out email-history.jsonl
 ```
+
+### `verify`
+
+```text
+jobqueue verify [-in path] [-json]
+```
+
+Verify an exported archive before long-term storage.
+
+The default input is standard input.
+
+The report lists broken references, invalid transitions, and retained-history warnings.
+
+The command returns a failure status when any record is invalid.
 
 ### `requeue`
 
@@ -692,11 +712,17 @@ a worker with age=1h0m0s prunes every 50ms; no external job is needed.
   activity: source=auto runs=<n> jobs_removed=2 events_removed=6
 the worker keeps the store small while it processes work.
 
+History verification
+--------------------
+  exported: 6 histories
+  verified: 6 histories; issues=0
+  live queue unchanged: true
+
 Queue state
 -----------
   completed: 6
 
-Recent events (32)
+Recent events (33)
 -----------------
   [12:00:00] <id> requeued attempts reset to 0/3
   [12:00:00] <id> dead_lettered attempt 3/3 exhausted: disk full
@@ -717,8 +743,13 @@ jobqueue_jobs{state="failed"} 0
 # HELP jobqueue_events_total Number of events per event type.
 # TYPE jobqueue_events_total counter
 jobqueue_events_total{type="enqueued"} 5
+jobqueue_events_total{type="scheduled"} 1
+jobqueue_events_total{type="leased"} 13
 jobqueue_events_total{type="lease_renewed"} 0
+jobqueue_events_total{type="acknowledged"} 6
+jobqueue_events_total{type="failed"} 0
 jobqueue_events_total{type="retried"} 5
+jobqueue_events_total{type="recovered"} 1
 jobqueue_events_total{type="dead_lettered"} 1
 jobqueue_events_total{type="requeued"} 1
 # HELP jobqueue_retention_runs_total Number of retention runs per source.
@@ -810,6 +841,18 @@ exported <count> job histories to history.jsonl
 {"schema_version":1,"job":{"id":"<id>","kind":"email","state":"completed"},"events":[{"event_type":"acknowledged"}]}
 ```
 
+Verify the archive with this command.
+
+```text
+$ jobqueue verify -in history.jsonl
+Archive verification
+  records:  1
+  valid:    1
+  warnings: 0
+  issues:   0
+status: valid
+```
+
 ## Verification
 
 Run the full test suite with this command.
@@ -831,13 +874,21 @@ Run queue benchmarks with this command.
 go test ./internal/queue -run '^$' -bench Benchmark -benchmem -count=1
 ```
 
-Verification status: module verification, local tests, vet, build, and benchmarks pass.
+Verification status: local tests, race tests, formatting, vet, and build pass.
+
+CI runs module verification on a clean Ubuntu module cache.
+
+The managed local cache cannot complete module verification without write access.
 
 CI runs the same checks on Ubuntu with the race detector.
 
 The web tests cover the dashboard, the JSON API, payload escaping, and access control.
 
 The export tests cover versioned JSON Lines output, stable history order, and filters.
+
+The archive tests cover valid histories, corrupt records, references, transitions, and retained suffixes.
+
+The verification test proves that the live database snapshot stays unchanged.
 
 The shared-file tests cover multi-process leases, recovery, and worker scaling.
 
@@ -877,26 +928,25 @@ Add a reverse proxy with HTTPS for any shared deployment.
 
 Handlers must honor context cancellation when a worker loses its lease.
 
+The verifier checks archives in memory.
+
+It does not repopulate SQLite or recover data removed by retention.
+
+A retained event suffix passes with a warning about missing earlier events.
+
 ## Roadmap
 
-- [x] Durable leases, retries, idempotency, crash recovery, and event history.
-- [x] Scheduled jobs with nanosecond-safe release times.
-- [x] Priority-aware dispatch with deterministic ordering.
-- [x] Priority aging to prevent starvation.
-- [x] Dead-letter queue with requeue of permanently failed jobs.
-- [x] Prometheus metrics for queue inspection.
-- [x] Browser dashboard for queue inspection.
-- [x] Horizontal scaling with a shared SQLite file.
-- [x] Authenticated dashboard access for shared deployments.
-- [x] Job retention policies and event log cleanup.
-- [x] Scheduled auto-retention from the worker process.
-- [x] Report retention activity in metrics and the dashboard.
-- [x] Browser requeue for dead-lettered jobs.
-- [x] Event history export for archival workflows.
-- [x] Fenced lease renewal for handlers that outlive the initial lease.
-- [ ] Restore and verify exported histories without changing live queue state.
+See [ROADMAP.md](ROADMAP.md) for milestone status, acceptance criteria, and verification commands.
 
 ### Release notes
+
+This release verifies exported histories without touching the live queue.
+
+The `verify` command reads JSON Lines into an isolated in-memory verifier.
+
+It reports broken event references, invalid transitions, duplicate records, and state mismatches.
+
+The demo proves that verification leaves its SQLite snapshot unchanged.
 
 This release adds fenced lease renewal for long-running handlers.
 

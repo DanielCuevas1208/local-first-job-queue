@@ -23,6 +23,7 @@ Commands:
   requeue  Return a dead-lettered job to the queue
   prune    Apply retention policy to the queue
   export   Write job histories as JSON Lines
+  verify   Verify an exported history archive
   seed     Load bundled sample data
   metrics  Expose queue state for Prometheus
   web      Serve the queue dashboard and requeue dead letters
@@ -51,6 +52,8 @@ Use <command> -help for command flags.`)
 		err = cli.Prune(args)
 	case "export":
 		err = cli.Export(args)
+	case "verify":
+		err = cli.Verify(args)
 	case "seed":
 		err = cli.Seed(args)
 	case "metrics":

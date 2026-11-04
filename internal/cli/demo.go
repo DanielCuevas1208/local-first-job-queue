@@ -1,15 +1,18 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/local-first-job-queue/internal/archive"
 	"github.com/local-first-job-queue/internal/fault"
 	"github.com/local-first-job-queue/internal/metrics"
 	"github.com/local-first-job-queue/internal/queue"
@@ -120,6 +123,13 @@ func Demo(args []string) error {
 	if _, err := store.LeaseJobByID(deltaID, -time.Hour); err != nil {
 		return fmt.Errorf("orphan lease: %w", err)
 	}
+	if err := store.AppendEvent(queue.Event{
+		JobID:     deltaID,
+		EventType: queue.EventLeased,
+		Timestamp: time.Now().UTC(),
+	}); err != nil {
+		return fmt.Errorf("log orphan lease: %w", err)
+	}
 	fmt.Println("\norphaned job delta was leased and then abandoned.")
 	fmt.Println("starting worker; it will recover orphans and process jobs.")
 	fmt.Println()
@@ -200,6 +210,9 @@ func Demo(args []string) error {
 	if err := showAutoRetention(*kind); err != nil {
 		return err
 	}
+	if err := showHistoryVerification(q, store); err != nil {
+		return err
+	}
 
 	fmt.Println()
 	snap, err = q.Inspect()
@@ -220,6 +233,46 @@ func Demo(args []string) error {
 	fmt.Printf("requeue a dead letter with: jobqueue requeue <id> -db %q\n", path)
 	fmt.Printf("prune old jobs with: jobqueue prune -age 168h -db %q\n", path)
 	fmt.Printf("view it in a browser with: jobqueue web -db %q\n", path)
+	return nil
+}
+
+// showHistoryVerification exports the live demo histories into memory, then
+// verifies them without opening or changing the live SQLite store.
+func showHistoryVerification(q *queue.Queue, store *queue.SQLiteStore) error {
+	before, err := q.Inspect()
+	if err != nil {
+		return fmt.Errorf("inspect before history verification: %w", err)
+	}
+	histories, err := store.GetJobHistories(queue.HistoryFilter{})
+	if err != nil {
+		return fmt.Errorf("read histories for verification: %w", err)
+	}
+	var encoded bytes.Buffer
+	exported, err := writeHistoryExport(&encoded, histories)
+	if err != nil {
+		return fmt.Errorf("encode histories for verification: %w", err)
+	}
+	report, err := archive.Verify(bytes.NewReader(encoded.Bytes()))
+	if err != nil {
+		return fmt.Errorf("verify demo histories: %w", err)
+	}
+	after, err := q.Inspect()
+	if err != nil {
+		return fmt.Errorf("inspect after history verification: %w", err)
+	}
+
+	unchanged := reflect.DeepEqual(before, after)
+	fmt.Println("\nHistory verification")
+	fmt.Println("-------------------")
+	fmt.Printf("  exported: %d histories\n", exported)
+	fmt.Printf("  verified: %d histories; issues=%d\n", report.ValidRecords, len(report.Issues))
+	fmt.Printf("  live queue unchanged: %t\n", unchanged)
+	if !report.Valid() {
+		return fmt.Errorf("demo history verification found %d issue(s)", len(report.Issues))
+	}
+	if !unchanged {
+		return fmt.Errorf("history verification changed the live queue")
+	}
 	return nil
 }
 
