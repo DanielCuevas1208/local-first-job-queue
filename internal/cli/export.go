@@ -7,16 +7,13 @@ import (
 	"io"
 	"os"
 
+	"github.com/local-first-job-queue/internal/archive"
 	"github.com/local-first-job-queue/internal/queue"
 )
 
-const historyExportVersion = 1
+const historyExportVersion = archive.SchemaVersion
 
-type historyExportRecord struct {
-	SchemaVersion int           `json:"schema_version"`
-	Job           queue.Job     `json:"job"`
-	Events        []queue.Event `json:"events"`
-}
+type historyExportRecord = archive.Record
 
 // Export writes current job snapshots and their retained event timelines as
 // versioned JSON Lines. The archive stays pipe-friendly when -out is omitted.
@@ -73,7 +70,7 @@ func writeHistoryExport(w io.Writer, histories []queue.JobHistory) (int, error) 
 	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	for _, history := range histories {
-		record := historyExportRecord{
+		record := archive.Record{
 			SchemaVersion: historyExportVersion,
 			Job:           history.Job,
 			Events:        history.Events,

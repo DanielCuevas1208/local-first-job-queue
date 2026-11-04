@@ -31,3 +31,4 @@ Thumbs.db
 # Local verification cache
 .gocache/
 .gotelemetry/
+.gomodcache/
